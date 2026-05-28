@@ -1,0 +1,3030 @@
+---
+title: "Cell line barcode analyses"
+format: html
+toc-depth: 4
+---
+
+## Preliminaries.
+
+Raw barcode count data are listed in Supplementary Tables S2, under the sheet names:
+
+* Barcodes_libr_&_Parental_Palbo (Parental_3_passage_3_Count)
+* Barcodes_Parental_Abema
+* Barcodes_Palbo_study
+* Barcodes_Abema_study
+* Barcodes_clones
+* Barcodes_tumors_&_recurrences
+
+In the below code, we read in barcode counts and metadata from tables that compile this same data together into a long-format. 
+
+### Load in libraries.
+
+```{r}
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(RColorBrewer)
+library(ggpubr)
+library(rstatix)
+library(philentropy)
+```
+
+### Create output data, plot folders.
+
+```{r}
+dir.create("data/raw/01-barcoding", recursive = TRUE) # input files
+dir.create("data/processed/01-barcoding", recursive = TRUE) # output data, plots
+```
+
+### Sample structure of formatted barcode count, metadata tables.
+
+```{r}
+print(str(readr::read_tsv(
+  "data/raw/01-barcoding/bct-counts_abema-gradual.tsv"
+)))
+print(str(readr::read_tsv(
+  "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv"
+)))
+
+print(str(readr::read_tsv(
+  "data/raw/01-barcoding/bct-counts_abema-gradual.tsv"
+)))
+print(str(readr::read_tsv(
+  "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv"
+)))
+
+print(str(readr::read_tsv(
+  "data/raw/03-in-vivo-barcoding/bct-counts_mice-met-18.tsv"
+)))
+print(str(readr::read_tsv(
+  "data/raw/03-in-vivo-barcoding/bct-metadata_mice-met-18.tsv"
+)))
+```
+
+### Load in plot color palettes.
+
+```{r}
+pal_orig.ident <- c(
+  "Mut_AbemaR" = "orange",
+  "WT_AbemaR" = "red",
+  "Mut_PalboR" = "lightblue",
+  "WT_PalboR" = "royalblue",
+  "WT_PalboR_Clone" = "purple",
+  "Mut_Vehicle" = "gray85",
+  "WT_Vehicle" = "gray30",
+  "Parental" = "burlywood4"
+)
+
+pal_treatment <- c(
+  "Abema" = "red",
+  "Palbo" = "royalblue",
+  "Vehicle" = "orange",
+  "Parental" = "burlywood4"
+)
+
+pal_esr1_status = c(
+  "WT" = "gray30",
+  "Y537S" = "gray85",
+  "Parental" = "burlywood4"
+)
+
+pal_kl_graph_name = c(
+  "WT Vehicle CTR of PalboR" = "gray30",
+  "Mut Vehicle CTR of PalboR" = "gray85",
+  "WT PalboR" = "royalblue",
+  "Mut PalboR" = "lightblue",
+
+  "WT Vehicle CTR of AbemaR" = "gray30",
+  "Mut Vehicle CTR of AbemaR" = "gray85",
+  "WT AbemaR" = "red",
+  "Mut AbemaR" = "orange"
+)
+
+pal_js_graph_name = c(
+  "WT Vehicle" = "gray30",
+  "Mut Vehicle" = "gray85",
+  "WT Palbo" = "royalblue",
+  "Mut Palbo" = "lightblue",
+  "WT Abema" = "red",
+  "Mut Abema" = "orange"
+)
+```
+
+## Load in function to plot clustered heatmap of barcoding expression, sample and barcode clusterings.
+
+```{r}
+#' Plot a heatmap of barcode counts above a threshold for a given set of samples.
+#'
+#' Cluster rows and columns using given feature and sample distance matrices.
+#'
+#' @param infile_counts Path to (long) barcode count matrix.
+#' @param infile_feature_dist Path to RDS of feature distances.
+#' @param infile_sample_dist Path to RDS of sample distances.
+#' @param infile_meta Path to sample metadata.
+#' @param dist_type Distance metric used to generate the feature dist and
+#' sample dist matrices.
+#' @param .condition Vector of Conditions to include in plot. Some of
+#' "Parental", "ND", "DOX".
+#' @param .treatment Vector of Treatments to include in plot. Some of "DMSO",
+#' "Parental", "Palbo", "Abema".
+#' Needed as pheatmap does not drop unused factor levels from heatmap legends.
+#' One of "Palbo", "Abema", "Palbo Abema Middle", "Palbo Abema",
+#' "Palbo Abema Parental".
+#' @param freq_thresh Minimum frequency threshold (0-1) to filter out low-frequency barcodes.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param title Plot title.
+#' @param lower_thresh Lower threshold to determine color breaks in pheatmap.
+#' @param data_dir Processed data directory.
+#' @param output_dir Processed output directory.
+#'
+#' @returns Pheatmap object of plot.
+plot_bct_counts_heatmap <- function(
+  infile_counts,
+  infile_feature_dist,
+  infile_sample_dist,
+  infile_meta,
+  dist_type,
+  .condition = c("Parental", "ND", "DOX"),
+  .treatment = c("Parental", "DMSO", "Abema", "Palbo"),
+  include_clone = FALSE,
+  clone_sample_names = NULL,
+  freq_thresh = 0.001,
+  width = 7,
+  height = 10,
+  title,
+  lower_thresh = -5,
+  data_dir = "data/processed/01-barcoding",
+  output_dir = "data/processed/01-barcoding"
+) {
+  counts <- read_tsv(infile_counts, show_col_types = FALSE)
+  feature_dist <- readRDS(infile_feature_dist)
+  sample_dist <- readRDS(infile_sample_dist)
+  meta <- purrr::map_dfr(
+    infile_meta,
+    readr::read_tsv,
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      graph_name = str_c(
+        forcats::fct_recode(
+          factor(experiment),
+          ag = "abema-gradual",
+          pg = "palbo-gradual",
+          pgc = "palbo-gradual-clones"
+        ),
+        forcats::fct_recode(factor(condition), WT = "ND", "Mut" = "DOX"),
+        forcats::fct_recode(
+          factor(treatment),
+          AbemaR = "Abema",
+          "PalboR" = "Palbo",
+          Vehicle = "DMSO"
+        ),
+        timepoint,
+        stringr::str_replace_na(replicate_id),
+        sep = " "
+      )
+    )
+
+  # Use actual sample names for clones to distinguish them properly from each other.
+  if (include_clone) {
+    meta <- purrr::map_dfr(
+      infile_meta,
+      readr::read_tsv,
+      show_col_types = FALSE
+    ) %>%
+      mutate(
+        treatment = case_when(
+          (experiment == "palbo-gradual-clones" & treatment == "PDR") ~ "Palbo", # fix PDR -> Palbo for clones
+          .default = treatment
+        )
+      ) |>
+      filter(
+        experiment != "palbo-gradual-clones" |
+          sample_name %in% clone_sample_names
+      ) |>
+      mutate(
+        graph_name = case_when(
+          experiment == "palbo-gradual-clones" ~ gsub(
+            "^[0-9]+_{1}",
+            "",
+            gsub("_CG.*", "", sample_name)
+          ),
+          .default = str_c(
+            forcats::fct_recode(
+              factor(experiment),
+              ag = "abema-gradual",
+              pg = "palbo-gradual",
+              pgc = "palbo-gradual-clones"
+            ),
+            forcats::fct_recode(factor(condition), WT = "ND", "Mut" = "DOX"),
+            forcats::fct_recode(
+              factor(treatment),
+              AbemaR = "Abema",
+              "PalboR" = "Palbo",
+              Vehicle = "DMSO"
+            ),
+            timepoint,
+            stringr::str_replace_na(replicate_id),
+            sep = " "
+          )
+        )
+      )
+  }
+
+  file_metadata_dist <- gsub(
+    ".*feature-dist_(.*)\\.rds",
+    "\\1",
+    infile_feature_dist
+  )
+  outfile <- file.path(
+    output_dir,
+    paste0("bct_frac_heatmap_", file_metadata_dist, ".pdf")
+  )
+  print(outfile)
+
+  feature_clust <- hclust(feature_dist)
+  sample_clust <- hclust(sample_dist)
+
+  dat_nxp_counts <- counts %>%
+    select(sample_name, barcode, count) %>%
+    inner_join(meta, by = "sample_name") %>% # implicitly filters to just things that are in meta and the counts matrix
+    mutate(
+      graph_name = case_when(
+        experiment == "palbo-gradual-clones" ~ gsub(
+          "^[0-9]+_{1}",
+          "",
+          gsub("_CG.*", "", sample_name)
+        ),
+        .default = str_c(
+          forcats::fct_recode(
+            factor(experiment),
+            ag = "abema-gradual",
+            pg = "palbo-gradual",
+            pgc = "palbo-gradual-clones"
+          ),
+          forcats::fct_recode(factor(condition), WT = "ND", "Mut" = "DOX"),
+          forcats::fct_recode(
+            factor(treatment),
+            AbemaR = "Abema",
+            "PalboR" = "Palbo",
+            Vehicle = "DMSO"
+          ),
+          timepoint,
+          stringr::str_replace_na(replicate_id),
+          sep = " "
+        )
+      )
+    ) |>
+    pivot_wider(
+      id_cols = barcode,
+      names_from = graph_name,
+      values_from = count,
+      values_fill = 0
+    )
+  dat_nxp_counts <- dat_nxp_counts %>%
+    column_to_rownames("barcode")
+  print(colSums(dat_nxp_counts))
+
+  dat_nxp <- counts %>%
+    select(sample_name, barcode, fraction) %>%
+    inner_join(meta, by = "sample_name") %>% # implicitly filters to just things that are in meta and the counts matrix
+    mutate(
+      graph_name = case_when(
+        experiment == "palbo-gradual-clones" ~ gsub(
+          "^[0-9]+_{1}",
+          "",
+          gsub("_CG.*", "", sample_name)
+        ),
+        .default = str_c(
+          forcats::fct_recode(
+            factor(experiment),
+            ag = "abema-gradual",
+            pg = "palbo-gradual",
+            pgc = "palbo-gradual-clones"
+          ),
+          forcats::fct_recode(factor(condition), WT = "ND", "Mut" = "DOX"),
+          forcats::fct_recode(
+            factor(treatment),
+            AbemaR = "Abema",
+            "PalboR" = "Palbo",
+            Vehicle = "DMSO"
+          ),
+          timepoint,
+          stringr::str_replace_na(replicate_id),
+          sep = " "
+        )
+      )
+    ) |>
+    pivot_wider(
+      id_cols = barcode,
+      names_from = graph_name,
+      values_from = fraction,
+      values_fill = 0
+    )
+  dat_nxp <- dat_nxp %>%
+    column_to_rownames("barcode")
+
+  col_anno <- meta %>%
+    select(graph_name, condition, treatment, experiment) %>%
+    filter(graph_name %in% names(dat_nxp)) %>%
+    rename(Treatment = treatment, `ESR1 Status` = condition) %>%
+    mutate(
+      `ESR1 Status` = fct_recode(
+        `ESR1 Status`,
+        WT = "ND",
+        Y537S = "DOX",
+        Parental = "Parental"
+      )
+    ) %>%
+    mutate(`Treatment` = fct_recode(`Treatment`, Vehicle = "DMSO")) %>%
+    column_to_rownames("graph_name")
+
+  anno_colors = list()
+  # Build up legend element-by-element
+  if ("Abema" %in% col_anno$Treatment) {
+    anno_colors[["Treatment"]] = c(anno_colors[["Treatment"]], "Abema" = "red")
+  }
+  if ("Palbo" %in% col_anno$Treatment) {
+    anno_colors[["Treatment"]] = c(
+      anno_colors[["Treatment"]],
+      "Palbo" = "royalblue"
+    )
+  }
+  if ("Vehicle" %in% col_anno$Treatment) {
+    anno_colors[["Treatment"]] = c(
+      anno_colors[["Treatment"]],
+      "Vehicle" = "gold"
+    )
+  }
+  if ("Parental" %in% col_anno$Treatment) {
+    anno_colors[["Treatment"]] = c(
+      anno_colors[["Treatment"]],
+      "Parental" = "burlywood4"
+    )
+  }
+
+  if ("WT" %in% col_anno$`ESR1 Status`) {
+    anno_colors[["ESR1 Status"]] = c(
+      anno_colors[["ESR1 Status"]],
+      "WT" = "gray30"
+    )
+  }
+  if ("Y537S" %in% col_anno$`ESR1 Status`) {
+    anno_colors[["ESR1 Status"]] = c(
+      anno_colors[["ESR1 Status"]],
+      "Y537S" = "gray85"
+    )
+  }
+  if ("Parental" %in% col_anno$`ESR1 Status`) {
+    anno_colors[["ESR1 Status"]] = c(
+      anno_colors[["ESR1 Status"]],
+      "Parental" = "burlywood4"
+    )
+  }
+
+  if ("palbo-gradual-clones" %in% col_anno$experiment) {
+    col_anno <- col_anno |>
+      mutate(
+        `Bulk/Clone` = case_when(
+          experiment == "palbo-gradual-clones" ~ "Clone",
+          .default = "Bulk"
+        )
+      ) |>
+      mutate(
+        `Bulk/Clone` = factor(`Bulk/Clone`, levels = c("Bulk", "Clone"))
+      ) |>
+      relocate(`Bulk/Clone`, .before = `ESR1 Status`)
+    anno_colors[["Bulk/Clone"]] = c(
+      anno_colors[["Bulk/Clone"]],
+      "Bulk" = "burlywood4"
+    )
+    anno_colors[["Bulk/Clone"]] = c(
+      anno_colors[["Bulk/Clone"]],
+      "Clone" = "burlywood1"
+    )
+  }
+
+  # reorder treatment levels
+  col_anno <- col_anno |>
+    mutate(
+      Treatment = forcats::fct_relevel(
+        Treatment,
+        "Abema",
+        "Palbo",
+        "Vehicle",
+        "Parental"
+      )
+    )
+
+  # Remove experiment annotation
+  col_anno <- col_anno |> select(-experiment)
+
+  # Make sure we're keeping each sample separate, just swapping out some names for
+  # more readable version in the graph.
+  stopifnot(
+    length(unique(rownames(col_anno))) == dim(dat_nxp)[[2]],
+    dim(dat_nxp)[[2]] == length(unique(counts$sample_name))
+  )
+
+  # Remove any zero-valued counts before logging and plotting (avoids color
+  # scale getting altered by log(ct+pseudocount))
+  set.seed(238038)
+  print(pheatmap::pheatmap(
+    log10(
+      ((dat_nxp |>
+        mutate(across(everything(), \(x) {
+          na_if(x, 0)
+        }))))
+    ),
+    color = rev(viridis::magma(150)),
+    breaks = seq(lower_thresh, 0, length.out = 151),
+    cluster_cols = sample_clust,
+    cluster_rows = feature_clust,
+    annotation_col = col_anno,
+    annotation_colors = anno_colors,
+    show_rownames = FALSE,
+    show_colnames = TRUE,
+    border_color = NA,
+    width = width,
+    height = height,
+    main = title,
+    angle_col = 90,
+    drop_levels = TRUE,
+    na_col = "gray"
+  ))
+}
+```
+
+## Load in function to plot barcode fishplots.
+
+```{r}
+#' Plot a fishplot of barcode fractions above a threshold and calculate
+#' the normalized KL divergence against a discrete uniform distribution
+#' for the End timepoint for each bioreplicate for the 8 clusters.
+#'
+#' This function gets run indirectly when [get_sample_feature_dist_bct_counts()]
+#' is called with parameter plot_fishplot = TRUE. We recommend running in this
+#' indirect way to ensure input files are generated correctly with distance
+#' matrices.
+#'
+#' @param infile_full_counts Path to table of unfiltered barcode counts.
+#' @param infile_counts Path to table of filtered barcode counts from [get_sample_feature_dist_bct_counts()].
+#' @param infile_feature_dist Path to distance matrix of barcodes from [get_sample_feature_dist_bct_counts()].
+#' @param infile_sample_dist Path to distance matrix of samples from [get_sample_feature_dist_bct_counts()].
+#' @param infile_meta Path to sample metadata.
+#' @param nclust Number of clusters to cut in fishplot.
+#' @param dist_type Distance metric used to generate the feature dist and
+#' sample dist matrices.
+#' @param width = Plot width (in).
+#' @param height Plot height (in).
+#' @param title Plot title.
+#' @param subtitle Plot subtitle.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_bct_frac_fishplot <- function(
+  infile_full_counts,
+  infile_counts,
+  infile_feature_dist,
+  infile_sample_dist,
+  infile_meta,
+  nclust,
+  dist_type,
+  width = 6,
+  height = 4,
+  title,
+  subtitle,
+  ddir = "data/processed/01-barcoding",
+  odir = "data/processed/01-barcoding"
+) {
+  if (!dir.exists(file.path(ddir, "fishplots", dist_type))) {
+    dir.create(file.path(ddir, "fishplots", dist_type), recursive = TRUE)
+  }
+  if (!dir.exists(file.path(odir, "fishplots", dist_type))) {
+    dir.create(file.path(odir, "fishplots", dist_type), recursive = TRUE)
+  }
+
+  full_counts <- read_tsv(infile_full_counts, show_col_types = FALSE)
+  counts <- read_tsv(infile_counts, show_col_types = FALSE)
+  feature_dist <- readRDS(infile_feature_dist)
+  sample_dist <- readRDS(infile_sample_dist)
+  meta <- read_tsv(infile_meta) %>%
+    mutate(
+      condition = factor(condition, levels = c("Parental", "ND", "DOX")),
+      treatment = factor(
+        treatment,
+        levels = c("Parental", "DMSO", "Abema", "Palbo")
+      ),
+      dose = factor(dose, levels = c("/", "50nM", "200nM", "1uM")),
+      timepoint = factor(
+        timepoint,
+        levels = c("Parental", "Early", "Middle", "End")
+      ),
+      replicate_id = factor(replicate_id, levels = c("1", "2", "3"))
+    )
+
+  # Order graphnames
+  ml <- meta %>%
+    arrange(condition, treatment, timepoint, dose, replicate_id) %>%
+    mutate(
+      graph_name = str_c(
+        condition,
+        treatment,
+        dose,
+        timepoint,
+        replicate_id,
+        sep = "_"
+      )
+    ) %>%
+    pull(graph_name)
+
+  # Order filenames
+  gl <- meta %>%
+    arrange(condition, treatment, timepoint, dose, replicate_id) %>%
+    pull(sample_name)
+
+  # Generate output filenames
+  file_metadata_dist <- gsub(
+    ".*feature-dist_(.*)\\.rds",
+    "\\1",
+    infile_feature_dist
+  )
+
+  # Loop through replicates to make a organize fishplot data for (Parent + (each biorepl))
+  # Note, the same parental sample is used for all bioreplicates.
+  counts_mat_repl_all_replicates <- purrr::map(1:3, \(i) {
+    counts_repl <- counts %>%
+      filter(treatment == "Parental" | replicate_id == i) %>%
+      filter(!is.na(timepoint)) %>%
+      mutate(
+        graph_name = str_c(
+          condition,
+          treatment,
+          dose,
+          timepoint,
+          replicate_id,
+          sep = "_"
+        )
+      ) %>%
+      mutate(graph_name = factor(graph_name, levels = ml))
+
+    counts_repl <- counts_repl %>%
+      left_join(full_counts, by = c("sample_name", "barcode")) %>%
+      mutate(
+        fraction = case_when(
+          count.x == 0 ~ 0, # need to account for 0 count barcodes
+          TRUE ~ fraction.x
+        )
+      ) |>
+      mutate(predicted_cluster = factor(predicted_cluster))
+
+    # Number of unique barcodes per cluster
+    cluster_cts <- counts_repl |>
+      group_by(predicted_cluster, .drop = FALSE) |>
+      mutate(
+        predicted_cluster_n = sprintf(
+          "Cluster %s (N=%i)",
+          predicted_cluster,
+          length(unique(barcode))
+        )
+      ) |>
+      distinct(predicted_cluster, predicted_cluster_n)
+
+    counts_mat_repl <- counts_repl |>
+      group_by(
+        sample_name,
+        condition,
+        treatment,
+        dose,
+        timepoint,
+        replicate_id,
+        predicted_cluster,
+        .drop = FALSE
+      ) %>%
+      summarize(fraction = sum(fraction)) |>
+      left_join(cluster_cts, by = "predicted_cluster") |>
+      dplyr::rename(`Cluster` = predicted_cluster_n) |>
+      dplyr::mutate(
+        timepoint = factor(
+          timepoint,
+          levels = c("Parental", "Early", "Middle", "End")
+        )
+      )
+
+    cluster_cts <- counts_repl |>
+      dplyr::group_by(predicted_cluster, .drop = FALSE) |>
+      dplyr::mutate(
+        predicted_cluster_n = sprintf(
+          "%s (N=%i)",
+          predicted_cluster,
+          length(unique(barcode))
+        )
+      ) |>
+      dplyr::distinct(predicted_cluster, predicted_cluster_n)
+
+    counts_mat_repl <- counts_repl |>
+      dplyr::group_by(
+        sample_name,
+        condition,
+        treatment,
+        dose,
+        timepoint,
+        replicate_id,
+        predicted_cluster,
+        .drop = FALSE
+      ) %>%
+      dplyr::summarize(fraction = sum(fraction)) |>
+      dplyr::left_join(cluster_cts, by = "predicted_cluster") |>
+      dplyr::rename(`Cluster` = predicted_cluster_n) |>
+      dplyr::mutate(
+        timepoint = factor(
+          timepoint,
+          levels = c("Parental", "Early", "Middle", "End")
+        )
+      )
+
+    counts_repl_bioreplicate_id <- counts_repl |>
+      dplyr::left_join(cluster_cts, by = "predicted_cluster") |>
+      mutate(plot_bioreplicate_id = sprintf("Bioreplicate %i", i))
+    return(counts_repl_bioreplicate_id)
+  }) |>
+    purrr::list_rbind()
+
+  # Format data for plotting.
+  counts_mat_repl_all_replicates2 <- counts_mat_repl_all_replicates |>
+    dplyr::group_by(
+      sample_name,
+      condition,
+      treatment,
+      dose,
+      timepoint,
+      replicate_id,
+      predicted_cluster_n,
+      plot_bioreplicate_id,
+      .drop = FALSE
+    ) %>%
+    dplyr::summarize(fraction = sum(fraction)) |>
+    dplyr::rename(`Cluster` = "predicted_cluster_n") |>
+    dplyr::mutate(
+      timepoint = factor(
+        timepoint,
+        levels = c("Parental", "Early", "Middle", "End")
+      )
+    )
+
+  # For each (timpoint, Cluster, plot_bioreplicate_id) combination that exists,
+  #' impute a zero barcode fraction where that barcode is not seen
+  #' (artifact of preprocessing).
+  counts_mat_repl_all_replicates2 <- counts_mat_repl_all_replicates2 |>
+    ungroup() |>
+    tidyr::complete(
+      timepoint,
+      Cluster,
+      plot_bioreplicate_id,
+      fill = list(fraction = 0)
+    )
+
+  plt <- counts_mat_repl_all_replicates2 |>
+    ggplot2::ggplot(aes(
+      x = timepoint,
+      y = fraction,
+      fill = Cluster,
+      group = Cluster
+    )) +
+    ggplot2::geom_area(stat = "identity") +
+    ggplot2::labs(title = title, y = "Fraction", x = NULL) +
+    ggplot2::lims(y = c(0, 1)) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      text = element_text(size = 8),
+      title = element_text(size = 6),
+      strip.text = element_text(size = 6),
+      legend.key.size = unit(0.3, "cm"),
+      legend.title = element_text(size = 6),
+      legend.text = element_text(size = 5),
+      legend.margin = margin(t = -20, unit = "pt"),
+      panel.grid.major = element_line(linewidth = 0.3),
+      panel.grid.minor = element_line(linewidth = .2)
+    ) +
+    ggplot2::scale_x_discrete(expand = expansion(add = .2)) +
+    ggplot2::facet_wrap(~plot_bioreplicate_id, nrow = 1) +
+    scale_fill_manual(
+      values = rev(c(
+        "#AFDCE3",
+        "#E5C494",
+        "#2B388F",
+        "#96B53C",
+        "#EC1C24",
+        "#1B75BB",
+        "#F6881E",
+        "#259664"
+      ))
+    )
+
+  outfile <- file.path(
+    odir,
+    "fishplots",
+    dist_type,
+    sprintf("fishplot_%s.pdf", file_metadata_dist)
+  )
+  ggsave(outfile, plt, width = 17, height = 4, units = "cm")
+
+  # Write out the normalized KL divergence against a discrete uniform distribution
+  #' for the End timepoint for each bioreplicate for the 8 clusters.
+  shannon_results <- counts_mat_repl_all_replicates2 |>
+    dplyr::group_by(plot_bioreplicate_id, timepoint) |>
+    dplyr::mutate(fraction_rescaled = fraction / sum(fraction)) |>
+    dplyr::summarize(
+      n_unique_barcodes = dplyr::n(),
+      normalized_kl_divergence = philentropy::KL(
+        rbind(
+          fraction_rescaled,
+          (rep(1, length(fraction_rescaled)) / length(fraction_rescaled))
+        ),
+        unit = "log"
+      ) /
+        log(length(fraction_rescaled)),
+      n_unique_barcodes_check = length(fraction_rescaled)
+    ) |>
+    dplyr::mutate(metadata = file_metadata_dist)
+  saveRDS(
+    shannon_results,
+    file.path(
+      ddir,
+      "fishplots",
+      dist_type,
+      sprintf(
+        "shannon-kl-divergence-fishplot-alltimepoints-%s.rds",
+        file_metadata_dist
+      )
+    )
+  )
+
+  return(plt)
+}
+```
+
+## Load function to cluster barcodes and samples.
+
+Note, this function indirectly calls functions to plot heatmaps and fishplots of barcodes.
+
+```{r}
+#' Cluster barcodes by their counts according to the given distance metric and
+#' write files of distance matrices, corresponding count matrices, and optionally
+#' plots a heatmap, fishplot of the log barcode fractions.
+#'
+#' Only includes barcodes that are above a specified frequency threshold at
+#' least once in the dataset.
+#'
+#' @param infile_meta Filepath to tsv of barcode metadata.
+#' @param infile_counts Filepath to tsv of barcode counts data.
+#' @param freq_thresh Frequency threshold used to cluster all barcodes with
+#' maximum frequency (across samples) less than freq_thresh to their  own
+#' separate cluster.
+#' @param nclust Number of clusters (besides 0) to cut hclust at.
+#' @param .condition Condition to filter to. One of c("DOX", "ND", "Parental").
+#' @param .treatment Treatment to filter to. One of c("Parental", "DMSO", "Abema", "Palbo")
+#' @param .Timepoint Timepoint to filter to. One of c("Parental", "Early", "Middle", "End")
+#' @param dist_metric Distance metric/ preprocessing done on counts matrix to cluster.
+#' @param include_palbo_gradual_dmso_only Include Palbo-gradual DMSO only when
+#' @param plot_heatmap Plot barcode-sample heatmap?
+#' @param plot_fishplot Plot barcode fishplot?
+#' @param plt_title Plot title.
+#' @param include_clone Logical. Include the WT Palbo clone if the clones infiles are given?
+#' @param clone_sample_names Sample names of clones to include in plot.
+#' @param clone_suffix Suffix to include in output filepaths to identify which clone samples were included.
+#' @param exclude_abema_vehicle Logical. Exclude Abema experiment Vehicle samples?
+#' @param outfile_counts Path to write long tibble of barcode counts and fractions. Automatically generated if NULL.
+#' @param outfile_counts_nxp Path to write nxp matrix of raw barcode counts. Automatically generated if NULL.
+#' @param outfile_sample_dist Path to write sample clustering information. Automatically generated if NULL.
+#' @param outfile_feature_dist Path to write feature (barcode) clustering information. Automatically generated if NULL.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+get_sample_feature_dist_bct_counts <- function(
+  infile_meta,
+  infile_counts,
+  freq_thresh = 0.001,
+  nclust = 8,
+  .condition,
+  .treatment,
+  .Timepoint = c("Parental", "Early", "Middle", "End"),
+  dist_metric,
+  include_palbo_gradual_dmso_only = FALSE,
+  plot_heatmap = FALSE,
+  plot_fishplot = FALSE,
+  plt_title = "",
+  include_clone = FALSE,
+  clone_sample_names = NULL,
+  clone_suffix = NULL,
+  exclude_abema_vehicle = TRUE,
+  outfile_counts = NULL,
+  outfile_counts_nxp = NULL,
+  outfile_sample_dist = NULL,
+  outfile_feature_dist = NULL,
+  ddir = "data/processed/01-barcoding",
+  odir = "data/processed/01-barcoding"
+) {
+  dist_metric <- match.arg(
+    dist_metric,
+    c("column-swept-ppr", "log-fraction-euclidean")
+  )
+
+  # Generate output filenames (avoids mistakes with manually specifying filenames)
+  experiment <- paste0(
+    gsub(".*bct-metadata_(.*)\\.tsv", "\\1", infile_meta),
+    collapse = "_"
+  )
+  filename_metadata <- sprintf(
+    "%s_%s_%s_%s_thresh%s",
+    paste0(experiment, collapse = "-"),
+    paste0(.condition, collapse = "-"),
+    paste0(.treatment, collapse = "-"),
+    paste0(.Timepoint, collapse = "-"),
+    gsub("\\.", "p", as.character(freq_thresh))
+  )
+  file_metadata_dist <- sprintf(
+    "%s_%s_%s_%s_%s_thresh%s",
+    paste0(dist_metric, collapse = "-"),
+    paste0(experiment, collapse = "-"),
+    paste0(.condition, collapse = "-"),
+    paste0(.treatment, collapse = "-"),
+    paste0(.Timepoint, collapse = "-"),
+    gsub("\\.", "p", as.character(freq_thresh))
+  )
+
+  # Automatially generate output filenames if not specified.
+  if (is.null(outfile_counts)) {
+    outfile_counts <- file.path(
+      ddir,
+      paste0("feature-counts_", file_metadata_dist, ".tsv")
+    )
+  }
+  if (is.null(outfile_counts_nxp)) {
+    outfile_counts_nxp <- file.path(
+      ddir,
+      paste0("feature-counts-nxp_", file_metadata_dist, ".tsv")
+    )
+  }
+  if (is.null(outfile_sample_dist)) {
+    outfile_sample_dist <- file.path(
+      ddir,
+      paste0("sample-dist_", file_metadata_dist, ".rds")
+    )
+  }
+  if (is.null(outfile_feature_dist)) {
+    outfile_feature_dist <- file.path(
+      ddir,
+      paste0("feature-dist_", file_metadata_dist, ".rds")
+    )
+  }
+
+  meta <- purrr::map_dfr(
+    infile_meta,
+    readr::read_tsv,
+    show_col_types = FALSE
+  ) %>%
+    filter(condition %in% .condition, treatment %in% .treatment) %>%
+    mutate(
+      condition = factor(condition, levels = c("Parental", "ND", "DOX")),
+      treatment = factor(
+        treatment,
+        levels = c("Parental", "DMSO", "Abema", "Palbo")
+      ),
+      dose = factor(dose, levels = c("/", "50nM", "200nM", "1uM")),
+      timepoint = factor(
+        timepoint,
+        levels = c("Parental", "Early", "Middle", "End")
+      ),
+      replicate_id = factor(replicate_id, levels = c("1", "2", "3"))
+    ) %>%
+    mutate(
+      graph_name = str_c(
+        condition,
+        treatment,
+        dose,
+        timepoint,
+        replicate_id,
+        sep = "_"
+      )
+    )
+
+  # just want to include the WT Palbo Clone (3_15) (same sample as we have scrnaseq on)
+  if (include_clone) {
+    meta <- purrr::map_dfr(
+      infile_meta,
+      readr::read_tsv,
+      show_col_types = FALSE
+    ) %>%
+      mutate(
+        treatment = case_when(
+          (experiment == "palbo-gradual-clones" & treatment == "PDR") ~ "Palbo", # fix PDR -> Palbo for clones
+          .default = treatment
+        )
+      ) |>
+      filter(
+        experiment != "palbo-gradual-clones" |
+          sample_name %in% clone_sample_names
+      ) |>
+      filter(condition %in% .condition, treatment %in% .treatment) %>%
+      mutate(
+        condition = factor(condition, levels = c("Parental", "ND", "DOX")),
+        treatment = factor(
+          treatment,
+          levels = c("Parental", "DMSO", "Abema", "Palbo")
+        ),
+        dose = factor(dose, levels = c("/", "50nM", "200nM", "1uM")),
+        timepoint = factor(
+          timepoint,
+          levels = c("Parental", "Early", "Middle", "End")
+        ),
+        replicate_id = factor(replicate_id, levels = c("1", "2", "3"))
+      ) %>%
+      mutate(
+        graph_name = str_c(
+          condition,
+          treatment,
+          dose,
+          timepoint,
+          stringr::str_replace_na(replicate_id),
+          sep = "_"
+        )
+      )
+
+    # Automatially generate output filenames if not specified with a suffix for what clones are included.
+    outfile_counts <- file.path(
+      ddir,
+      sprintf("feature-counts_%s_%s.tsv", filename_metadata, clone_suffix)
+    )
+    outfile_counts_nxp <- file.path(
+      ddir,
+      sprintf("feature-counts-nxp_%s_%s.tsv", filename_metadata, clone_suffix)
+    )
+    outfile_sample_dist <- file.path(
+      ddir,
+      sprintf("sample-dist_%s_%s.rds", file_metadata_dist, clone_suffix)
+    )
+    outfile_feature_dist <- file.path(
+      ddir,
+      sprintf("feature-dist_%s_%s.rds", file_metadata_dist, clone_suffix)
+    )
+  }
+
+  counts <- purrr::map_dfr(
+    infile_counts,
+    readr::read_tsv,
+    show_col_types = FALSE
+  )
+
+  counts_meta <- counts %>%
+    left_join(meta, by = "sample_name") %>%
+    filter(
+      condition %in% .condition,
+      treatment %in% .treatment,
+      timepoint %in% .Timepoint
+    ) %>%
+    arrange(barcode, treatment, timepoint, replicate_id) %>%
+    select(-fraction) %>% # drop existing fraction and recalculate
+    group_by(sample_name) %>%
+    mutate(fraction = count / sum(count)) %>% # recalculate fraction per sample -- this is just dividing the count matrix by a scale factor (colsums) row vector (separate for each sample)
+    ungroup() %>%
+    select(-filename) %>%
+    relocate(fraction, .after = count)
+
+  # If specified take Palbo-gradual experiment Vehicle treated samples, not Palbo treated
+  if (include_palbo_gradual_dmso_only) {
+    counts_meta <- counts_meta |>
+      filter(!(experiment == "palbo-gradual" & treatment == "Palbo"))
+  }
+
+  # If Palbo, Abema, DMSO present, only take the DMSO from the Palbo sample
+  if (
+    all(.treatment %in% c("Palbo", "Abema", "DMSO")) &
+      (length(unique(.treatment)) == 3) &
+      exclude_abema_vehicle
+  ) {
+    counts_meta <- counts_meta %>%
+      filter(!(experiment == "abema-gradual" & treatment == "DMSO"))
+  }
+
+  # If Palbo, Abema, DMSO, Parental present, only take the DMSO and Parental from the Palbo sample
+  if (
+    all(.treatment %in% c("Palbo", "Abema", "DMSO", "Parental")) &
+      length(unique(.treatment)) == 4
+  ) {
+    counts_meta <- counts_meta %>%
+      filter(!(experiment == "abema-gradual" & treatment == "DMSO")) %>%
+      filter(!(experiment == "abema-gradual" & treatment == "Parental"))
+  }
+
+  counts_meta_geq_thresh <- counts_meta %>%
+    group_by(barcode) %>% # Filter out any barcodes that are below a certain threshold across all observations
+    filter(max(fraction) >= freq_thresh) %>%
+    ungroup()
+
+  counts_meta_geq_thresh_nxp <- counts_meta_geq_thresh %>%
+    select(sample_name, barcode, count) %>%
+    pivot_wider(
+      id_cols = barcode,
+      names_from = sample_name,
+      values_from = count,
+      values_fill = 0
+    )
+
+  # Write out both long and pivoted (version that gets dist() called on it) to file.
+  write_tsv(counts_meta_geq_thresh_nxp, file = outfile_counts_nxp)
+
+  counts_meta_geq_thresh_nxp <- counts_meta_geq_thresh_nxp %>%
+    column_to_rownames("barcode")
+
+  # Barcode Fraction clustering.
+  if (dist_metric == "log-fraction-euclidean") {
+    counts_meta_geq_thresh_nxp <- counts_meta_geq_thresh %>%
+      select(sample_name, barcode, fraction) %>%
+      pivot_wider(
+        id_cols = barcode,
+        names_from = sample_name,
+        values_from = fraction,
+        values_fill = 0
+      )
+    counts_meta_geq_thresh_nxp <- counts_meta_geq_thresh_nxp %>%
+      column_to_rownames("barcode")
+    feature_dist <- dist(log(counts_meta_geq_thresh_nxp + 1e-12))
+    sample_dist <- dist(t(log(counts_meta_geq_thresh_nxp + 1e-12)))
+  }
+
+  # Divide out the column sums to get all samples on the same scale, then
+  # calculate genewise poisson pearson residuals, then take Euclidean
+  # distances on these.
+  if (dist_metric == "column-swept-ppr") {
+    #' p = (c - mu)/sqrt(mu)
+    counts_meta_geq_thresh_nxp_colswept <- sweep(
+      counts_meta_geq_thresh_nxp,
+      2,
+      Matrix::colSums(counts_meta_geq_thresh_nxp),
+      `/`
+    )
+    pearson_residualized_counts = (counts_meta_geq_thresh_nxp_colswept -
+      Matrix::rowMeans(counts_meta_geq_thresh_nxp_colswept)) /
+      sqrt(Matrix::rowMeans(counts_meta_geq_thresh_nxp_colswept))
+    feature_dist <- dist(pearson_residualized_counts)
+    sample_dist <- dist(t(pearson_residualized_counts))
+  }
+
+  # Append a column of cluster assignment for each barcode.
+  feature_clust <- hclust(feature_dist)
+  clusters <- cutree(feature_clust, nclust)
+  clusters_tibble <- tibble(
+    barcode = names(clusters),
+    predicted_cluster = clusters
+  )
+  counts_meta_geq_thresh <- counts_meta_geq_thresh %>%
+    left_join(clusters_tibble, by = "barcode")
+
+  write_tsv(counts_meta_geq_thresh, file = outfile_counts) # contains barcode cluster assignments
+  readr::write_rds(feature_dist, outfile_feature_dist)
+  readr::write_rds(sample_dist, outfile_sample_dist)
+
+  if (plot_heatmap) {
+    plot_bct_counts_heatmap(
+      infile_counts = outfile_counts,
+      infile_feature_dist = outfile_feature_dist,
+      infile_sample_dist = outfile_sample_dist,
+      infile_meta = infile_meta,
+      dist_type = dist_metric,
+      include_clone = include_clone,
+      clone_sample_names = clone_sample_names,
+      title = plt_title
+    )
+  }
+
+  if (plot_fishplot) {
+    plot_bct_frac_fishplot(
+      infile_full_counts = infile_counts,
+      infile_counts = outfile_counts,
+      infile_feature_dist = outfile_feature_dist,
+      infile_sample_dist = outfile_sample_dist,
+      infile_meta = infile_meta,
+      nclust = nclust,
+      dist_type = dist_metric,
+      title = plt_title
+    )
+  }
+}
+```
+
+### Cluster and plot heatmap of barcodes for Palbo-resistant, Vehicle Endpoint samples (Figure 2C).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 8
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv",
+  freq_thresh = 0.01,
+  .condition = c("ND", "DOX"),
+  .treatment = c("Palbo", "DMSO"),
+  .Timepoint = "End",
+  include_clone = FALSE,
+  dist_metric = "log-fraction-euclidean",
+  plot_heatmap = TRUE,
+  plt_title = sprintf("End: PalboR, Vehicle; %s thresh", 0.01)
+)
+```
+
+### Cluster and plot heatmap of barcodes for Abema-resistant, Vehicle Endpoint samples (Figure 2D).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 8
+get_sample_feature_dist_bct_counts(
+  infile_meta = list("data/raw/01-barcoding/bct-metadata_abema-gradual.tsv"),
+  infile_counts = list("data/raw/01-barcoding/bct-counts_abema-gradual.tsv"),
+  freq_thresh = 0.01,
+  .condition = c("ND", "DOX"),
+  .treatment = c("Abema", "DMSO"),
+  .Timepoint = "End",
+  include_clone = FALSE,
+  dist_metric = "log-fraction-euclidean",
+  plot_heatmap = TRUE,
+  plt_title = sprintf("End: AbemaR, Vehicle; %s thresh", 0.01)
+)
+```
+
+### Cluster and plot heatmap of barcodes for Abema-resistant, Palbo-resistant, and Vehicle Endpoint samples (Figure 4B).
+
+This function call includes Vehicle samples from both Abema and Palbo experiments.
+
+```{r}
+#| fig-width: 6
+#| fig-height: 8
+get_sample_feature_dist_bct_counts(
+  infile_meta = list(
+    "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+    "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv"
+  ),
+  infile_counts = list(
+    "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+    "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv"
+  ),
+  freq_thresh = 0.001,
+  .condition = c("ND", "DOX"),
+  .treatment = c("Palbo", "Abema", "DMSO"),
+  .Timepoint = "End",
+  include_clone = FALSE,
+  dist_metric = "log-fraction-euclidean",
+  plot_heatmap = TRUE,
+  exclude_abema_vehicle = FALSE,
+  plt_title = sprintf("End: PalboR, AbemaR, Vehicle; %s thresh", 0.001)
+)
+```
+
+## Load in function to plot KL divergences of sample barcode distributions.
+
+```{r}
+#' Plot normalized KL divergences of barcode fraction distributions against a
+#' discrete uniform reference for the specified cell line samples.
+#'
+#' Uses normalized natural log KL divergences as D_{KL}(P||Q) / log(|P|) where P
+#' is the sample barcode fraction distribution and Q is the discrete uniform
+#' distribution over the same number of total barcodes using philentropy::KL,
+#' and |P| is the total number of discrete atoms in the discrete distributions P, Q.
+#'
+#' Note, normalized KL divergences are used here instead of Shannon entropies.
+#'
+#' @param infile_counts Path to barcode counts.
+#' @param infile_meta Path to barcode metadata.
+#' @param plt_var_x Variable to run ANOVA/ttests on and plot on x axis.
+#' @param plt_t_test_var1 Numerator variable of t test. If left NULL, keeps
+#' the overall ANOVA F test among all plotted groups and all pairwise t-tests.
+#' @param plt_t_test_var2 Denominator variable of t test. If left NULL, keeps
+#' the overall ANOVA F test among all plotted groups and all pairwise t-tests.
+#' @param .condition Vector of conditions to filter to.
+#' @param .treatment Vector of treatments to filter to.
+#' @param .timepoint Vector of timepionts to filter to.
+#' @param include_palbo_gradual_dmso_only Include only the DMSO Vehicle sample
+#' from palbo gradual?
+#' @param padj.signif.stars Plot significance stars for ajusted pvalues of
+#' pairwise comparisons?
+#' @param freq_thresh Barcode frequency threshold to filter out any barcode
+#' that fails to meet threshold over any timepoint for a sample.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param data_dir Processed data directory.
+#' @param output_dir Processed output directory.
+plot_barcode_fraction_KL_divergences_against_discrete_uniform_cell_line <- function(
+  infile_counts,
+  infile_meta,
+  plt_var_x,
+  plt_t_test_var1 = NULL,
+  plt_t_test_var2 = NULL,
+  .condition = c("Parental", "ND", "DOX"),
+  .treatment = c("Parental", "DMSO", "Abema", "Palbo"),
+  .timepoint = c("Parental", "Early", "Middle", "End"),
+  include_palbo_gradual_dmso_only = FALSE,
+  padj.signif.stars = TRUE,
+  freq_thresh = NULL,
+  width = 5,
+  height = 5,
+  data_dir = "data/processed/01-barcoding",
+  output_dir = "data/processed/01-barcoding"
+) {
+  counts <- purrr::map_dfr(
+    infile_counts,
+    readr::read_tsv,
+    show_col_types = FALSE
+  )
+  meta <- purrr::map_dfr(
+    infile_meta,
+    readr::read_tsv,
+    show_col_types = FALSE
+  ) %>%
+    dplyr::mutate(
+      condition = factor(condition, levels = c("Parental", "ND", "DOX")),
+      treatment = factor(
+        treatment,
+        levels = c("Parental", "DMSO", "Palbo", "Abema")
+      ),
+      dose = factor(dose, levels = c("/", "50nM", "200nM", "1uM")),
+      timepoint = factor(
+        timepoint,
+        levels = c("Parental", "Early", "Middle", "End")
+      ),
+      replicate_id = factor(replicate_id, levels = c("1", "2", "3")),
+      experiment = factor(
+        experiment,
+        levels = c("palbo-gradual", "abema-gradual")
+      )
+    ) %>%
+    dplyr::mutate(
+      graph_color = dplyr::case_when(
+        treatment == "DMSO" & condition == "ND" ~ "DMSO-ND",
+        treatment == "DMSO" & condition == "DOX" ~ "DMSO-DOX",
+        treatment == "Palbo" & condition == "ND" ~ "Palbo-ND",
+        treatment == "Palbo" & condition == "DOX" ~ "Palbo-DOX",
+        treatment == "Abema" & condition == "ND" ~ "Abema-ND",
+        treatment == "Abema" & condition == "DOX" ~ "Abema-DOX",
+        .default = "Parental"
+      )
+    ) %>%
+    dplyr::mutate(
+      graph_color = factor(
+        graph_color,
+        levels = c(
+          "Parental",
+          "DMSO-ND",
+          "DMSO-DOX",
+          "Palbo-ND",
+          "Palbo-DOX",
+          "Abema-ND",
+          "Abema-DOX"
+        )
+      )
+    )
+
+  col_pal <- list(
+    "DMSO-ND" = RColorBrewer::brewer.pal(12, "Paired")[[7]],
+    "DMSO-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[8]],
+    "Palbo-ND" = RColorBrewer::brewer.pal(12, "Paired")[[1]],
+    "Palbo-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[2]],
+    "Abema-ND" = RColorBrewer::brewer.pal(12, "Paired")[[3]],
+    "Abema-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[4]],
+    "Parental" = "gray85"
+  )
+
+  expt <- gsub(".*bct-metadata_(.*)\\.tsv", "\\1", infile_meta)
+
+  ml <- meta %>%
+    dplyr::arrange(
+      experiment,
+      treatment,
+      condition,
+      timepoint,
+      dose,
+      replicate_id
+    ) %>%
+    dplyr::mutate(
+      graph_name = str_c(
+        experiment,
+        treatment,
+        condition,
+        timepoint,
+        sep = "\n"
+      )
+    ) %>%
+    dplyr::pull(graph_name) %>%
+    unique()
+
+  meta <- meta %>%
+    dplyr::mutate(
+      graph_name = stringr::str_c(
+        experiment,
+        treatment,
+        condition,
+        timepoint,
+        sep = "\n"
+      )
+    ) %>%
+    dplyr::mutate(graph_name = factor(graph_name, levels = ml)) %>%
+    dplyr::mutate(
+      graph_name = forcats::fct_recode(
+        graph_name,
+        `Mut Vehicle CTR of AbemaR` = "abema-gradual\nDMSO\nDOX\nEnd",
+        `Mut AbemaR` = "abema-gradual\nAbema\nDOX\nEnd",
+        `WT Vehicle CTR of AbemaR` = "abema-gradual\nDMSO\nND\nEnd",
+        `WT AbemaR` = "abema-gradual\nAbema\nND\nEnd",
+
+        `Mut Vehicle CTR of PalboR` = "palbo-gradual\nDMSO\nDOX\nEnd",
+        `Mut PalboR` = "palbo-gradual\nPalbo\nDOX\nEnd",
+        `WT Vehicle CTR of PalboR` = "palbo-gradual\nDMSO\nND\nEnd",
+        `WT PalboR` = "palbo-gradual\nPalbo\nND\nEnd"
+      )
+    ) |>
+    dplyr::filter(
+      timepoint %in% .timepoint,
+      condition %in% .condition,
+      treatment %in% .treatment
+    ) %>%
+    dplyr::mutate(graph_color = forcats::fct_drop(graph_color))
+
+  counts_meta <- counts %>%
+    dplyr::inner_join(meta, by = "sample_name") %>%
+    dplyr::select(-fraction) %>% # drop existing fraction and recalculate
+    dplyr::group_by(sample_name) %>%
+    dplyr::mutate(fraction = count / sum(count)) %>%
+    dplyr::ungroup()
+
+  counts_meta <- counts_meta %>%
+    dplyr::filter(
+      timepoint %in% .timepoint,
+      condition %in% .condition,
+      treatment %in% .treatment
+    ) |>
+    dplyr::filter(!is.na(timepoint)) # remove unused samples.
+
+  if (!is.null(freq_thresh)) {
+    counts_meta <- counts_meta %>%
+      dplyr::group_by(barcode) %>% # Filter out any barcodes that are below a certain threshold across all observations
+      dplyr::filter(max(fraction) >= freq_thresh) %>%
+      dplyr::ungroup()
+  }
+
+  # If specified take Palbo-gradual experiment Vehicle treated samples, not Palbo treated
+  if (include_palbo_gradual_dmso_only) {
+    counts_meta <- counts_meta |>
+      dplyr::filter(!(experiment == "palbo-gradual" & treatment == "Palbo"))
+  }
+
+  # If Palbo, Abema, DMSO present, only take the DMSO from the Palbo sample
+  if (
+    all(c("Palbo", "Abema", "DMSO") %in% .treatment) &
+      length(unique(.treatment)) == 3
+  ) {
+    counts_meta <- counts_meta %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "DMSO"))
+  }
+
+  # If Palbo, Abema, DMSO, Parental present, only take the DMSO and Parental from the Palbo sample
+  if (
+    all(c("Palbo", "Abema", "DMSO", "Parental") %in% .treatment) &
+      length(unique(.treatment == 4))
+  ) {
+    counts_meta <- counts_meta %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "DMSO")) %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "Parental"))
+  }
+
+  # Test if proper subset of samples is selected
+  stopifnot(
+    all(counts_meta$timepoint %in% .timepoint),
+    length(unique(counts_meta$timepoint)) == length(unique(.timepoint)),
+    all(counts_meta$condition %in% .condition),
+    length(unique(counts_meta$condition)) == length(unique(.condition)),
+    all(counts_meta$treatment %in% .treatment),
+    length(unique(counts_meta$treatment)) == length(unique(.treatment))
+  )
+
+  counts_meta_entropy <- counts_meta |>
+    dplyr::group_by(
+      sample_name,
+      graph_name,
+      graph_color,
+      timepoint,
+      condition,
+      treatment,
+      replicate_id
+    ) %>%
+    dplyr::summarize(
+      n_unique_barcodes = dplyr::n(),
+      n_count_barcodes = sum(count),
+      kl_divergence = philentropy::KL(
+        rbind(fraction, (rep(1, length(fraction)) / length(fraction))),
+        unit = "log"
+      ) /
+        log(length(fraction)),
+      n_unique_barcodes_check = length(fraction)
+    ) |>
+    dplyr::rename(Bioreplicate = replicate_id)
+
+  # Plot KL divergences against a discrete normal density
+  i <- "kl_divergence"
+  yla = "Normalized KL divergence of barcode distribution\nagainst discrete uniform distribution"
+
+  if (include_palbo_gradual_dmso_only) {
+    outfile <- sprintf(
+      file.path(
+        output_dir,
+        "barcode-fraction-KL-divergences_%s_%s_%s_%s_%s_palbo-gradual-DMSO-only.pdf"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-"),
+      i
+    )
+    outfile_ttests <- sprintf(
+      file.path(
+        data_dir,
+        "barcode-fraction-KL-divergences_%s_%s_%s_%s_%s_palbo-gradual-DMSO-only.csv"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-"),
+      i
+    )
+    print(outfile)
+  } else {
+    outfile <- sprintf(
+      file.path(
+        output_dir,
+        "barcode-fraction-KL-divergences_%s_%s_%s_%s_%s.pdf"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-"),
+      i
+    )
+    outfile_ttests <- sprintf(
+      file.path(data_dir, "barcode-fraction-KL-divergences_%s_%s_%s_%s_%s.csv"),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-"),
+      i
+    )
+    print(outfile)
+  }
+
+  # Run an ANOVA across all categories.
+  anova_res <- anova(lm(kl_divergence ~ graph_name, data = counts_meta_entropy))
+  anova_subtitle <- sprintf(
+    "(F(%i,%i)=%.2f; p=%.2e)",
+    anova_res$Df[[1]],
+    anova_res$Df[[2]],
+    anova_res$`F value`[[1]],
+    anova_res$`Pr(>F)`[[1]]
+  )
+
+  counts_meta_entropy_noparental <- counts_meta_entropy |>
+    filter(timepoint != "Parental") # The one obs per group here causes issues with the sd estimation
+
+  res_ttests <- counts_meta_entropy_noparental |>
+    ungroup() |> # need to ungroup or else this breaks pairwite_t_test!
+    dplyr::mutate(graph_name = forcats::fct_drop(graph_name)) |> # drop unused factor levels or t test tries to test empty groups
+    rstatix::pairwise_t_test(
+      formula = kl_divergence ~ graph_name,
+      detailed = TRUE,
+      pool.sd = FALSE,
+      var.equal = FALSE
+    ) |>
+    rstatix::add_y_position()
+  readr::write_csv(
+    res_ttests |>
+      mutate(
+        group1 = gsub("\n", " ", group1),
+        group2 = gsub("\n", " ", group2)
+      ) |>
+      as_tibble(),
+    outfile_ttests
+  )
+  print(res_ttests, n = 100)
+
+  set.seed(840)
+  plt <- counts_meta_entropy |>
+    ggplot2::ggplot(ggplot2::aes(x = graph_name, y = !!sym(i))) +
+    ggplot2::geom_point(
+      aes(color = graph_name, shape = Bioreplicate), # color shape aes here or else ggpubr::stat_pvalue_manual breaks
+      position = ggplot2::position_dodge2(width = .5),
+      size = 3
+    ) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = yla,
+      title = "Barcode fraction distribution KL divergences",
+      subtitle = anova_subtitle
+    ) +
+    ggplot2::ylim(0, NA) +
+    ggplot2::scale_color_manual(
+      values = pal_kl_graph_name,
+      drop = TRUE,
+      guide = "none"
+    )
+
+  if (padj.signif.stars) {
+    plt <- plt +
+      ggpubr::stat_pvalue_manual(res_ttests, label = "p.adj.signif") +
+      ggplot2::scale_y_continuous(
+        breaks = c(0, .25, .5, .75, 1, 1.25),
+        limits = c(0, 1.35)
+      ) # so plots line up nicely
+  }
+
+  if (!is.null(plt_t_test_var1) & !is.null(plt_t_test_var2)) {
+    a <- counts_meta_entropy |>
+      filter(!!sym(plt_var_x) == plt_t_test_var1) |>
+      pull(!!sym(i))
+    b <- counts_meta_entropy |>
+      filter(!!sym(plt_var_x) == plt_t_test_var2) |>
+      pull(!!sym(i))
+
+    print(counts_meta_entropy |> filter(!!sym(plt_var_x) == plt_t_test_var1))
+    print(counts_meta_entropy |> filter(!!sym(plt_var_x) == plt_t_test_var2))
+
+    ttest_summary <- t.test(a, b)
+
+    outfile <- sprintf(
+      file.path(
+        output_dir,
+        "barcode-fraction-KL-divergences_%s_%s_%s_%s_%s_vs_%s_%s.pdf"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-"),
+      plt_t_test_var1,
+      plt_t_test_var2,
+      i
+    )
+
+    plt <- plt +
+      labs(
+        subtitle = sprintf(
+          "t-test: %s vs %s; pval = %s",
+          plt_t_test_var1,
+          plt_t_test_var2,
+          signif(ttest_summary$p.value, 4)
+        )
+      )
+    # }
+  }
+  ggplot2::ggsave(outfile, plt, height = height, width = width)
+  return(plt)
+}
+```
+
+### Plot KL divergences for Palbo, Vehicle samples (Figure 2E).
+
+```{r}
+plot_barcode_fraction_KL_divergences_against_discrete_uniform_cell_line(
+  infile_counts = "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv",
+  infile_meta = "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv",
+  .condition = c("ND", "DOX"),
+  .treatment = c("Palbo", "DMSO"),
+  .timepoint = c("End"),
+  freq_thresh = NULL
+)
+```
+
+### Plot KL divergences for Abema, Vehicle samples (Figure 2F).
+
+```{r}
+plot_barcode_fraction_KL_divergences_against_discrete_uniform_cell_line(
+  infile_counts = "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+  infile_meta = "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+  .condition = c("ND", "DOX"),
+  .treatment = c("Abema", "DMSO"),
+  .timepoint = c("End"),
+  freq_thresh = NULL
+)
+```
+
+## Load in function to plot sample-sample heatmap of JS divergences of sample barcode distributions.
+
+```{r}
+#' Plot sample-sample heatmap of Jensen-Shannon divergences of each sample
+#' compared against every other sample for the specified cell line samples.
+#'
+#' Note, this is a symmetric divergence metric that uses the mean distribution
+#' .5(P+Q) of the two input distributions P, Q.
+#'
+#' @param infile_counts Path to barcode counts.
+#' @param infile_meta Path to barcode metadata.
+#' @param .condition Vector of conditions to filter to.
+#' @param .treatment Vector of treatments to filter to.
+#' @param .timepoint Vector of timepionts to filter to.
+#' @param include_palbo_gradual_dmso_only Include only the DMSO Vehicle sample
+#' from the palbo gradual experiment samples?
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param data_dir Processed data directory.
+#' @param output_dir Processed output directory.
+plot_barcode_fraction_JS_divergences <- function(
+  infile_counts,
+  infile_meta,
+  .condition = c("Parental", "ND", "DOX"),
+  .treatment = c("Parental", "DMSO", "Abema", "Palbo"),
+  .timepoint = c("Parental", "Early", "Middle", "End"),
+  include_palbo_gradual_dmso_only = FALSE,
+  width = 7,
+  height = 7,
+  data_dir = "data/processed/01-barcoding",
+  output_dir = "data/processed/01-barcoding"
+) {
+  counts <- purrr::map_dfr(
+    infile_counts,
+    readr::read_tsv,
+    show_col_types = FALSE
+  )
+  meta <- purrr::map_dfr(
+    infile_meta,
+    readr::read_tsv,
+    show_col_types = FALSE
+  ) %>%
+    dplyr::mutate(
+      condition = factor(condition, levels = c("Parental", "ND", "DOX")),
+      treatment = factor(
+        treatment,
+        levels = c("Parental", "DMSO", "Palbo", "Abema")
+      ),
+      dose = factor(dose, levels = c("/", "50nM", "200nM", "1uM")),
+      timepoint = factor(
+        timepoint,
+        levels = c("Parental", "Early", "Middle", "End")
+      ),
+      replicate_id = factor(replicate_id, levels = c("1", "2", "3")),
+      experiment = factor(
+        experiment,
+        levels = c("palbo-gradual", "abema-gradual")
+      )
+    ) %>%
+    dplyr::mutate(
+      graph_color = dplyr::case_when(
+        treatment == "DMSO" & condition == "ND" ~ "DMSO-ND",
+        treatment == "DMSO" & condition == "DOX" ~ "DMSO-DOX",
+        treatment == "Palbo" & condition == "ND" ~ "Palbo-ND",
+        treatment == "Palbo" & condition == "DOX" ~ "Palbo-DOX",
+        treatment == "Abema" & condition == "ND" ~ "Abema-ND",
+        treatment == "Abema" & condition == "DOX" ~ "Abema-DOX",
+        .default = "Parental"
+      )
+    ) %>%
+    dplyr::mutate(
+      graph_color = factor(
+        graph_color,
+        levels = c(
+          "Parental",
+          "DMSO-ND",
+          "DMSO-DOX",
+          "Palbo-ND",
+          "Palbo-DOX",
+          "Abema-ND",
+          "Abema-DOX"
+        )
+      )
+    )
+
+  col_pal <- list(
+    "DMSO-ND" = RColorBrewer::brewer.pal(12, "Paired")[[7]],
+    "DMSO-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[8]],
+    "Palbo-ND" = RColorBrewer::brewer.pal(12, "Paired")[[1]],
+    "Palbo-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[2]],
+    "Abema-ND" = RColorBrewer::brewer.pal(12, "Paired")[[3]],
+    "Abema-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[4]],
+    "Parental" = "gray85"
+  )
+
+  expt <- gsub(".*bct-metadata_(.*)\\.tsv", "\\1", infile_meta)
+
+  ml <- meta %>%
+    dplyr::arrange(
+      experiment,
+      treatment,
+      condition,
+      timepoint,
+      dose,
+      replicate_id
+    ) %>%
+    dplyr::mutate(
+      graph_name = str_c(experiment, treatment, condition, timepoint, sep = " ")
+    ) %>%
+    dplyr::pull(graph_name) %>%
+    unique()
+
+  meta <- meta %>%
+    dplyr::mutate(
+      graph_name = stringr::str_c(
+        experiment,
+        treatment,
+        condition,
+        timepoint,
+        sep = " "
+      )
+    ) %>%
+    dplyr::mutate(graph_name = factor(graph_name, levels = ml)) %>%
+    dplyr::mutate(
+      graph_name = forcats::fct_recode(
+        graph_name,
+        `Mut Vehicle CTR of AbemaR` = "abema-gradual DMSO DOX End",
+        `Mut AbemaR` = "abema-gradual Abema DOX End",
+        `WT Vehicle CTR of AbemaR` = "abema-gradual DMSO ND End",
+        `WT AbemaR` = "abema-gradual Abema ND End",
+
+        `Mut Vehicle CTR of PalboR` = "palbo-gradual DMSO DOX End",
+        `Mut PalboR` = "palbo-gradual Palbo DOX End",
+        `WT Vehicle CTR of PalboR` = "palbo-gradual DMSO ND End",
+        `WT PalboR` = "palbo-gradual Palbo ND End"
+      )
+    ) |>
+    dplyr::filter(
+      timepoint %in% .timepoint,
+      condition %in% .condition,
+      treatment %in% .treatment
+    ) %>%
+    dplyr::mutate(graph_color = forcats::fct_drop(graph_color))
+
+  counts_meta <- counts %>%
+    dplyr::inner_join(meta, by = "sample_name") %>%
+    dplyr::select(-fraction) %>% # drop existing fraction and recalculate
+    dplyr::group_by(sample_name) %>%
+    dplyr::mutate(fraction = count / sum(count)) %>%
+    dplyr::ungroup()
+
+  counts_meta <- counts_meta %>%
+    dplyr::filter(
+      timepoint %in% .timepoint,
+      condition %in% .condition,
+      treatment %in% .treatment
+    ) |>
+    dplyr::filter(!is.na(timepoint)) # remove unused samples.
+
+  # If specified take Palbo-gradual experiment Vehicle treated samples, not Palbo treated
+  if (include_palbo_gradual_dmso_only) {
+    counts_meta <- counts_meta |>
+      dplyr::filter(!(experiment == "palbo-gradual" & treatment == "Palbo"))
+  }
+
+  # If Palbo, Abema, DMSO present, only take the DMSO from the Palbo sample
+  if (
+    all(c("Palbo", "Abema", "DMSO") %in% .treatment) &
+      length(unique(.treatment)) == 3
+  ) {
+    counts_meta <- counts_meta %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "DMSO"))
+  }
+
+  # If Palbo, Abema, DMSO, Parental present, only take the DMSO and Parental from the Palbo sample
+  if (
+    all(c("Palbo", "Abema", "DMSO", "Parental") %in% .treatment) &
+      length(unique(.treatment == 4))
+  ) {
+    counts_meta <- counts_meta %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "DMSO")) %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "Parental"))
+  }
+
+  # Test if proper subset of samples is selected
+  stopifnot(
+    all(counts_meta$timepoint %in% .timepoint),
+    length(unique(counts_meta$timepoint)) == length(unique(.timepoint)),
+    all(counts_meta$condition %in% .condition),
+    length(unique(counts_meta$condition)) == length(unique(.condition)),
+    all(counts_meta$treatment %in% .treatment),
+    length(unique(counts_meta$treatment)) == length(unique(.treatment))
+  )
+
+  frac_meta_wide <- counts_meta |>
+    dplyr::mutate(
+      graph_name_replicate_id = stringr::str_c(graph_name, " ", replicate_id)
+    ) |>
+    tidyr::pivot_wider(
+      id_cols = graph_name_replicate_id,
+      names_from = barcode,
+      values_from = fraction,
+      values_fill = 0
+    ) |>
+    tibble::column_to_rownames("graph_name_replicate_id") |>
+    as.matrix()
+
+  res <- philentropy::distance(
+    x = frac_meta_wide,
+    method = "jensen-shannon",
+    test.na = TRUE,
+    unit = "log2",
+    est.prob = NULL,
+    use.row.names = TRUE
+  )
+  res_dist <- as.dist(res)
+
+  colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+  res_evolutionary_replicates <- res |>
+    as.data.frame() |>
+    tibble::rownames_to_column("s1") |>
+    tibble::as_tibble() |>
+    tidyr::pivot_longer(cols = !s1, names_to = "s2", values_to = "js") |>
+    dplyr::filter(s1 != s2) |>
+    dplyr::mutate(grp_s1 = gsub(" [123]", "", s1)) |>
+    dplyr::mutate(grp_s2 = gsub(" [123]", "", s2)) |>
+    dplyr::filter(
+      (grepl("WT", s1) & grepl("WT", s2)) |
+        (grepl("Mut", s1) & grepl("Mut", s2))
+    ) |>
+    dplyr::filter(
+      (grepl("Palbo", grp_s1) & grepl("Abema", grp_s2)) |
+        (grepl("Abema", grp_s1) & grepl("Palbo", grp_s2))
+    ) |>
+    dplyr::group_by(grp_s1, grp_s2) |>
+    dplyr::summarize(
+      min_js = (min(js)),
+      max_js = (max(js)),
+      min_js_round = round(min(js), 2),
+      max_js_round = round(max(js), 2)
+    )
+
+  res_evolutionary_replicates <- res |>
+    as.data.frame() |>
+    tibble::rownames_to_column("s1") |>
+    tibble::as_tibble() |>
+    tidyr::pivot_longer(cols = !s1, names_to = "s2", values_to = "js") |>
+    dplyr::filter(s1 != s2) |>
+    dplyr::mutate(grp_s1 = gsub(" [123]", "", s1)) |>
+    dplyr::mutate(grp_s2 = gsub(" [123]", "", s2)) |>
+    dplyr::filter(grp_s1 == grp_s2)
+
+  res_evolutionary_replicates |>
+    dplyr::arrange(js) |>
+    dplyr::mutate(js_round = round(js, 2)) |>
+    print(n = 1000)
+
+  res_evolutionary_replicates |>
+    dplyr::arrange(js) |>
+    dplyr::mutate(js_round = round(js, 2)) |>
+    dplyr::group_by(grp_s1, grp_s2) |>
+    dplyr::summarize(min_js = round(min(js), 2), max_js = round(max(js), 2)) |>
+    print(n = 1000)
+
+  if (include_palbo_gradual_dmso_only) {
+    outfile <- sprintf(
+      file.path(
+        output_dir,
+        "barcode-fraction-JS-divergences_%s_%s_%s_%s_palbo-gradual-DMSO-only.pdf"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-")
+    )
+    outfile_with_numbers <- sprintf(
+      file.path(
+        output_dir,
+        "barcode-fraction-JS-divergences-with-numbers_%s_%s_%s_%s_palbo-gradual-DMSO-only.pdf"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-")
+    )
+    print(outfile)
+  } else {
+    outfile <- sprintf(
+      file.path(output_dir, "barcode-fraction-JS-divergences_%s_%s_%s_%s.pdf"),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-")
+    )
+    outfile_with_numbers <- sprintf(
+      file.path(
+        output_dir,
+        "barcode-fraction-JS-divergences-with-numbers_%s_%s_%s_%s.pdf"
+      ),
+      paste0(expt, collapse = "-"),
+      paste0(.timepoint, collapse = "-"),
+      paste0(.condition, collapse = "-"),
+      paste0(.treatment, collapse = "-")
+    )
+    print(outfile)
+  }
+
+  print(
+    pheatmap::pheatmap(
+    res,
+    clustering_distance_rows = res_dist,
+    clustering_distance_cols = res_dist,
+    breaks = seq(0, 1, length.out = 256),
+    col = colors,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    main = "JS Divergence",
+    # filename = outfile_with_numbers, # uncomment to save to file
+    width = width + 2,
+    height = height + 2,
+    cellwidth = 20,
+    cellheight = 20,
+    display_numbers = TRUE
+  ))
+}
+```
+
+### Plot sample-sample heatmap of JS divergences for Palbo, Vehicle samples (Figure 2G).
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+plot_barcode_fraction_JS_divergences(
+  infile_counts = c("data/raw/01-barcoding/bct-counts_palbo-gradual.tsv"),
+  infile_meta = c("data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv"),
+  .condition = c("DOX", "ND"),
+  .treatment = c("DMSO", "Palbo"),
+  .timepoint = c("End"),
+  width = 7
+)
+```
+
+### Plot sample-sample heatmap of JS divergences for Abema, Vehicle samples (Figure 2H).
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+plot_barcode_fraction_JS_divergences(
+  infile_counts = c("data/raw/01-barcoding/bct-counts_abema-gradual.tsv"),
+  infile_meta = c("data/raw/01-barcoding/bct-metadata_abema-gradual.tsv"),
+  .condition = c("DOX", "ND"),
+  .treatment = c("Abema", "DMSO"),
+  .timepoint = c("End"),
+  width = 7
+)
+```
+
+## Load function to plot JS divergences over time.
+
+```{r}
+#' Plot Jensen-Shannon divergences of each sample over time, run paired
+#' t-tests comparing timepoints.
+#'
+#' Note, this is a symmetric divergence metric that uses the mean distribution
+#' .5(P+Q) of your two input distributions P, Q.
+#'
+#' @param infile_counts Path to barcode counts.
+#' @param infile_meta Path to barcode metadata.
+#' @param .condition Vector of conditions to filter to.
+#' @param .treatment Vector of treatments to filter to.
+#' @param .timepoint Vector of timepionts to filter to.
+#' @param include_palbo_gradual_dmso_only Include only the DMSO Vehicle sample
+#' from palbo gradual?
+#' @param freq_thresh Barcode frequency threshold to filter out any barcode
+#' that fails to meet threshold over any timepoint for a sample.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param data_dir Processed data directory.
+#' @param output_dir Processed output directory.
+plot_barcode_fraction_JS_divergences_scatterplot <- function(
+  infile_counts,
+  infile_meta,
+  .condition = c("Parental", "ND", "DOX"),
+  .treatment = c("Parental", "DMSO", "Abema", "Palbo"),
+  .timepoint = c("Parental", "Early", "Middle", "End"),
+  include_palbo_gradual_dmso_only = FALSE,
+  freq_thresh = NULL,
+  width = 5,
+  height = 4,
+  data_dir = "data/processed/01-barcoding",
+  output_dir = "data/processed/01-barcoding"
+) {
+  counts <- purrr::map_dfr(
+    infile_counts,
+    readr::read_tsv,
+    show_col_types = FALSE
+  )
+  meta <- purrr::map_dfr(
+    infile_meta,
+    readr::read_tsv,
+    show_col_types = FALSE
+  ) %>%
+    dplyr::mutate(
+      condition = factor(condition, levels = c("Parental", "ND", "DOX")),
+      treatment = factor(
+        treatment,
+        levels = c("Parental", "DMSO", "Palbo", "Abema")
+      ),
+      dose = factor(dose, levels = c("/", "50nM", "200nM", "1uM")),
+      timepoint = factor(
+        timepoint,
+        levels = c("Parental", "Early", "Middle", "End")
+      ),
+      replicate_id = factor(replicate_id, levels = c("1", "2", "3")),
+      experiment = factor(
+        experiment,
+        levels = c("palbo-gradual", "abema-gradual")
+      )
+    ) %>%
+    dplyr::mutate(
+      graph_color = dplyr::case_when(
+        treatment == "DMSO" &
+          condition == "ND" &
+          experiment == "palbo-gradual" ~ "DMSO-ND-pg",
+        treatment == "DMSO" &
+          condition == "DOX" &
+          experiment == "palbo-gradual" ~ "DMSO-DOX-pg",
+        treatment == "DMSO" &
+          condition == "ND" &
+          experiment == "abema-gradual" ~ "DMSO-ND-ag",
+        treatment == "DMSO" &
+          condition == "DOX" &
+          experiment == "abema-gradual" ~ "DMSO-DOX-ag",
+        treatment == "Palbo" & condition == "ND" ~ "Palbo-ND",
+        treatment == "Palbo" & condition == "DOX" ~ "Palbo-DOX",
+        treatment == "Abema" & condition == "ND" ~ "Abema-ND",
+        treatment == "Abema" & condition == "DOX" ~ "Abema-DOX",
+        .default = "Parental"
+      )
+    ) %>%
+    dplyr::mutate(
+      graph_color = factor(
+        graph_color,
+        levels = c(
+          "Parental",
+          "DMSO-ND-pg",
+          "DMSO-DOX-pg",
+          "DMSO-ND-ag",
+          "DMSO-DOX-ag",
+          "Palbo-ND",
+          "Palbo-DOX",
+          "Abema-ND",
+          "Abema-DOX"
+        )
+      )
+    )
+
+  col_pal <- list(
+    "DMSO-ND-pg" = RColorBrewer::brewer.pal(12, "Paired")[[7]],
+    "DMSO-DOX-pg" = RColorBrewer::brewer.pal(12, "Paired")[[8]],
+    "DMSO-ND-ag" = RColorBrewer::brewer.pal(12, "Paired")[[7]],
+    "DMSO-DOX-ag" = RColorBrewer::brewer.pal(12, "Paired")[[8]],
+    "Palbo-ND" = RColorBrewer::brewer.pal(12, "Paired")[[1]],
+    "Palbo-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[2]],
+    "Abema-ND" = RColorBrewer::brewer.pal(12, "Paired")[[3]],
+    "Abema-DOX" = RColorBrewer::brewer.pal(12, "Paired")[[4]],
+    "Parental" = "gray85"
+  )
+
+  expt <- gsub(".*bct-metadata_(.*)\\.tsv", "\\1", infile_meta)
+
+  ml <- meta %>%
+    dplyr::arrange(
+      experiment,
+      treatment,
+      condition,
+      timepoint,
+      dose,
+      replicate_id
+    ) %>%
+    dplyr::mutate(
+      graph_name = str_c(experiment, treatment, condition, timepoint, sep = " ")
+    ) %>%
+    dplyr::pull(graph_name) %>%
+    unique()
+
+  meta <- meta %>%
+    dplyr::mutate(
+      graph_name = stringr::str_c(
+        experiment,
+        treatment,
+        condition,
+        timepoint,
+        sep = " "
+      )
+    ) %>%
+    dplyr::mutate(graph_name = factor(graph_name, levels = ml)) %>%
+    dplyr::mutate(
+      graph_name = forcats::fct_recode(
+        graph_name,
+        `Mut Vehicle CTR of AbemaR` = "abema-gradual DMSO DOX End",
+        `Mut AbemaR` = "abema-gradual Abema DOX End",
+        `WT Vehicle CTR of AbemaR` = "abema-gradual DMSO ND End",
+        `WT AbemaR` = "abema-gradual Abema ND End",
+
+        `Mut Vehicle CTR of PalboR` = "palbo-gradual DMSO DOX End",
+        `Mut PalboR` = "palbo-gradual Palbo DOX End",
+        `WT Vehicle CTR of PalboR` = "palbo-gradual DMSO ND End",
+        `WT PalboR` = "palbo-gradual Palbo ND End"
+      )
+    ) |>
+    dplyr::filter(
+      timepoint %in% .timepoint,
+      condition %in% .condition,
+      treatment %in% .treatment
+    ) %>%
+    dplyr::mutate(graph_color = forcats::fct_drop(graph_color))
+
+  counts_meta <- counts %>%
+    dplyr::inner_join(meta, by = "sample_name") %>%
+    dplyr::select(-fraction) %>% # drop existing fraction and recalculate
+    dplyr::group_by(sample_name) %>%
+    dplyr::mutate(fraction = count / sum(count)) %>%
+    dplyr::ungroup()
+
+  counts_meta <- counts_meta %>%
+    dplyr::filter(
+      timepoint %in% .timepoint,
+      condition %in% .condition,
+      treatment %in% .treatment
+    ) |>
+    dplyr::filter(!is.na(timepoint)) # remove unused samples.
+
+  # If specified take Palbo-gradual experiment Vehicle treated samples, not Palbo treated
+  if (include_palbo_gradual_dmso_only) {
+    counts_meta <- counts_meta |>
+      dplyr::filter(!(experiment == "palbo-gradual" & treatment == "Palbo"))
+  }
+
+  # If Palbo, Abema, DMSO present, only take the DMSO from the Palbo sample
+  if (
+    all(c("Palbo", "Abema", "DMSO") %in% .treatment) &
+      length(unique(.treatment)) == 3
+  ) {
+    counts_meta <- counts_meta %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "DMSO"))
+  }
+
+  # If Palbo, Abema, DMSO, Parental present, only take the DMSO and Parental from the Palbo sample
+  if (
+    all(c("Palbo", "Abema", "DMSO", "Parental") %in% .treatment) &
+      length(unique(.treatment == 4))
+  ) {
+    counts_meta <- counts_meta %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "DMSO")) %>%
+      dplyr::filter(!(experiment == "abema-gradual" & treatment == "Parental"))
+  }
+
+  # Test if proper subset of samples is selected
+  stopifnot(
+    all(counts_meta$timepoint %in% .timepoint),
+    length(unique(counts_meta$timepoint)) == length(unique(.timepoint)),
+    all(counts_meta$condition %in% .condition),
+    length(unique(counts_meta$condition)) == length(unique(.condition)),
+    all(counts_meta$treatment %in% .treatment),
+    length(unique(counts_meta$treatment)) == length(unique(.treatment))
+  )
+
+  frac_meta_wide <- counts_meta |>
+    dplyr::mutate(
+      graph_name_replicate_id = stringr::str_c(graph_name, " ", replicate_id)
+    ) |>
+    tidyr::pivot_wider(
+      id_cols = sample_name,
+      names_from = barcode,
+      values_from = fraction,
+      values_fill = 0
+    ) |>
+    tibble::column_to_rownames("sample_name") |>
+    as.matrix()
+
+  res <- philentropy::distance(
+    x = frac_meta_wide,
+    method = "jensen-shannon",
+    test.na = TRUE,
+    unit = "log2",
+    est.prob = NULL,
+    use.row.names = TRUE
+  )
+  res_dist <- as.dist(res)
+
+  colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+  res_df <- res |>
+    as.data.frame() |>
+    tibble::rownames_to_column("s1") |>
+    tibble::as_tibble() |>
+    tidyr::pivot_longer(cols = !s1, names_to = "s2", values_to = "js") |>
+    dplyr::filter(
+      s1 %in%
+        c(
+          "20171215_MCYS_D17_350_3_CG5109_S3_R1_001",
+          "20200226_Basal_P10_CG7902_S1_R1_001"
+        )
+    ) |> # The parental sample for either Palbo or Abema experiment
+    dplyr::filter(
+      !(s2 %in%
+        c(
+          "20171215_MCYS_D17_350_3_CG5109_S3_R1_001",
+          "20200226_Basal_P10_CG7902_S1_R1_001"
+        ))
+    ) |>
+    dplyr::inner_join(meta, by = c("s2" = "sample_name")) |>
+    dplyr::mutate(
+      condition = forcats::fct_recode(
+        condition,
+        `WT` = "ND",
+        `Mut` = "DOX"
+      )
+    ) |>
+    dplyr::mutate(
+      treatment = forcats::fct_recode(
+        treatment,
+        `Vehicle` = "DMSO"
+      )
+    ) |>
+    dplyr::mutate(graph_grp = stringr::str_c(condition, " ", treatment)) |>
+    dplyr::mutate(
+      graph_grp = forcats::fct_relevel(
+        graph_grp,
+        "WT Palbo",
+        "Mut Palbo",
+        "WT Abema",
+        "Mut Abema",
+        "WT Vehicle",
+        "Mut Vehicle"
+      )
+    ) |>
+    dplyr::rename(Replicate = "replicate_id")
+
+  res_df_wide <- res_df |>
+    dplyr::arrange(condition, timepoint, desc(timepoint), Replicate) |>
+    dplyr::mutate(timepoint = as.character(timepoint)) |>
+    dplyr::select(-passage, -dose, -graph_name, -s1, -s2) |>
+    tidyr::pivot_wider(names_from = timepoint, values_from = js)
+
+  # Run 'pairwise' (manually specified timepoint comparisons) **paired** ttests
+  out_res <- res_df_wide |>
+    dplyr::group_split(condition, treatment) |>
+    purrr::map(\(df) {
+      list(c("End", "Middle"), c("End", "Early"), c("Middle", "Early")) |>
+        purrr::map(\(tm) {
+          t.test(
+            x = (df |> dplyr::pull(!!sym(tm[[1]]))),
+            y = (df |> dplyr::pull(!!sym(tm[[2]]))),
+            paired = TRUE
+          ) |>
+            broom::tidy() |>
+            dplyr::mutate(group1 = tm[[1]], group2 = tm[[2]]) |>
+            dplyr::relocate(group1, group2)
+        }) |>
+        purrr::list_rbind() |>
+        dplyr::mutate(
+          condition = unique(df$condition),
+          treatment = unique(df$treatment)
+        ) |>
+        dplyr::relocate(condition, treatment)
+    }) |>
+    purrr::list_rbind() |>
+    dplyr::group_by(condition, treatment) |>
+    dplyr::mutate(p.adj.holm = p.adjust(p.value, method = "holm")) |>
+    dplyr::ungroup() |>
+    rstatix::add_significance(p.col = "p.adj.holm") # use default cutpoints, for graphing
+
+  outfile_paired_ttests <- sprintf(
+    file.path(
+      data_dir,
+      "barcode-fraction-JS-divergences-paired-ttests_%s_%s_%s_%s.csv"
+    ),
+    paste0(expt, collapse = "-"),
+    paste0(.timepoint, collapse = "-"),
+    paste0(.condition, collapse = "-"),
+    paste0(.treatment, collapse = "-")
+  )
+
+  readr::write_csv(out_res, outfile_paired_ttests)
+
+  (plt <- res_df |>
+    ggplot2::ggplot(aes(
+      y = js,
+      x = timepoint,
+      color = graph_grp,
+      shape = Replicate
+    )) +
+    ggplot2::geom_point(
+      size = 2,
+      position = ggplot2::position_dodge(width = .5)
+    ) +
+    ggplot2::scale_y_continuous(breaks = seq(0, 1.25, .25)) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      y = "JS divergence against Parental",
+      x = NULL,
+      color = "Group"
+    ) +
+    ggplot2::scale_color_manual(values = pal_js_graph_name) +
+    ggplot2::coord_cartesian(ylim = c(0, NA)))
+
+  if (nrow(out_res) == 3) {
+    plt <- plt +
+      ggpubr::stat_pvalue_manual(
+        out_res |>
+          dplyr::mutate(graph_grp = stringr::str_c(condition, " ", treatment)),
+        group = "graph_grp",
+        y.position = 1.1,
+        label = "p.adj.holm.signif",
+        step.increase = .1,
+        shape = NA,
+        legend.show = FALSE
+      )
+  }
+
+  (plt_faceted <- res_df |>
+    ggplot2::ggplot(aes(
+      y = js,
+      x = timepoint,
+      color = graph_grp,
+      shape = Replicate
+    )) +
+    ggplot2::geom_point(
+      size = 2,
+      position = ggplot2::position_dodge(width = .5)
+    ) +
+    ggplot2::scale_y_continuous(breaks = seq(0, 1.5, .25)) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      y = "JS divergence against Parental",
+      x = NULL,
+      color = "Group"
+    ) +
+    ggplot2::facet_wrap(~graph_grp) +
+    ggplot2::scale_color_manual(values = pal_js_graph_name) +
+    ggplot2::coord_cartesian(ylim = c(0, 1.5)) +
+    ggpubr::stat_pvalue_manual(
+      out_res |>
+        dplyr::mutate(graph_grp = stringr::str_c(condition, " ", treatment)) |>
+        dplyr::mutate(
+          graph_grp = forcats::fct_relevel(
+            graph_grp,
+            "WT Palbo",
+            "Mut Palbo",
+            "WT Abema",
+            "Mut Abema",
+            "WT Vehicle",
+            "Mut Vehicle"
+          )
+        ) |>
+        dplyr::group_by(graph_grp) |>
+        dplyr::mutate(ypos = 1.1 + (row_number() - 1) * 0.15) |> # manually make spacing for test sigstar brackets
+        dplyr::ungroup(),
+      group = "graph_grp",
+      y.position = "ypos",
+      label = "p.adj.holm.signif",
+      shape = NA,
+      legend.show = FALSE
+    ))
+
+  outfile <- sprintf(
+    file.path(
+      output_dir,
+      "barcode-fraction-JS-divergences-scatterplot_%s_%s_%s_%s.pdf"
+    ),
+    paste0(expt, collapse = "-"),
+    paste0(.timepoint, collapse = "-"),
+    paste0(.condition, collapse = "-"),
+    paste0(.treatment, collapse = "-")
+  )
+
+  outfile_faceted <- sprintf(
+    file.path(
+      output_dir,
+      "barcode-fraction-JS-divergences-scatterplot_%s_%s_%s_%s-faceted.pdf"
+    ),
+    paste0(expt, collapse = "-"),
+    paste0(.timepoint, collapse = "-"),
+    paste0(.condition, collapse = "-"),
+    paste0(.treatment, collapse = "-")
+  )
+
+  ggplot2::ggsave(outfile, plt, height = height, width = width)
+  ggplot2::ggsave(outfile_faceted, plt_faceted, height = 5, width = 6)
+  ggplot2::ggsave(
+    gsub("pdf$", "png", outfile),
+    plt,
+    height = height,
+    width = width
+  )
+
+  print(outfile)
+
+  return(plt_faceted)
+}
+```
+
+### Plot JS divergences over time for Palbo, Vehicle samples (Supplementary Figure S2G).
+
+```{r}
+plot_barcode_fraction_JS_divergences_scatterplot(
+  infile_counts = c("data/raw/01-barcoding/bct-counts_palbo-gradual.tsv"),
+  infile_meta = c("data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv"),
+  .condition = c("DOX", "ND", "Parental"),
+  .treatment = c("DMSO", "Palbo", "Parental")
+)
+```
+
+### Plot JS divergences over time for Abema, Vehicle samples (Supplementary Figure S2H).
+
+```{r}
+plot_barcode_fraction_JS_divergences_scatterplot(
+  infile_counts = c("data/raw/01-barcoding/bct-counts_abema-gradual.tsv"),
+  infile_meta = c("data/raw/01-barcoding/bct-metadata_abema-gradual.tsv"),
+  .condition = c("DOX", "ND", "Parental"),
+  .treatment = c("DMSO", "Abema", "Parental")
+)
+```
+
+### Plot sample-sample heatmap of JS divergences for Palbo, Abema samples (Figure 3A).
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+plot_barcode_fraction_JS_divergences(
+  infile_counts = c(
+    "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+    "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv"
+  ),
+  infile_meta = c(
+    "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+    "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv"
+  ),
+  .condition = c("DOX", "ND"),
+  .treatment = c("Abema", "Palbo"),
+  .timepoint = c("End"),
+  width = 7
+)
+```
+
+## Cluster and plot fishplots of clonal prevalence for Parental and PalboR and AbemaR evolutionary replicates. 
+
+### WT PalboR (Figure 3D).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "WT PalboR escalating",
+  .condition = c("Parental", "ND"),
+  .treatment = c("Parental", "Palbo"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+### Mut PalboR (Figure 3E).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "Mut PalboR escalating",
+  .condition = c("Parental", "DOX"),
+  .treatment = c("Parental", "Palbo"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+### WT AbemaR (Figure 3F).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "WT AbemaR",
+  .condition = c("Parental", "ND"),
+  .treatment = c("Parental", "Abema"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+### Mut AbemaR (Figure 3G).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "Mut AbemaR",
+  .condition = c("Parental", "DOX"),
+  .treatment = c("Parental", "Abema"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+## Load in function to plot KL divergences for clusters.
+
+```{r}
+#' Plot scatterplot of Shannon entropies of the 8 clusters per each given experimental
+#' condition, run ANOVA/ttest across plotted groups.
+#'
+#' Used to quantify how different drug treatments lead to different distributions
+#' of the End timepoint cluster cumulative fractions.
+#'
+#' @param infiles Vector of path to KL divergences of fishplot clusters
+#' generated by [plot_bct_frac_fishplot()].
+#' @param suffix Suffix to add to output filepath.
+#' @param filter_timepoint Vector of timepoints to filter to. Keeps all if NULL.
+#' @param padj.signif.stars Plot significance stars?
+#' @param dist_type Distance metric used to generate the feature dist and
+#' sample dist matrices.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_kl_divergences_clusters <- function(
+  infiles,
+  suffix,
+  filter_timepoint = NULL,
+  padj.signif.stars = TRUE,
+  dist_type = "column-swept-ppr",
+  ddir = "data/processed/01-barcoding",
+  odir = "data/processed/01-barcoding"
+) {
+  if (!dir.exists(file.path(ddir, "entropy-plots", dist_type))) {
+    dir.create(file.path(ddir, "entropy-plots", dist_type), recursive = TRUE)
+  }
+  if (!dir.exists(file.path(odir, "entropy-plots", dist_type))) {
+    dir.create(file.path(odir, "entropy-plots", dist_type), recursive = TRUE)
+  }
+
+  infiles |>
+    purrr::map_dfr(readRDS) |>
+    dplyr::distinct(metadata)
+
+  d_plt <- infiles |>
+    purrr::map_dfr(readRDS) |>
+    dplyr::mutate(
+      metadata_plt = forcats::fct_recode(
+        metadata,
+        `WT PalboR` = "column-swept-ppr_palbo-gradual_Parental-ND_Parental-Palbo_Parental-Early-Middle-End_thresh0p001",
+        `Mut PalboR` = "column-swept-ppr_palbo-gradual_Parental-DOX_Parental-Palbo_Parental-Early-Middle-End_thresh0p001",
+        `WT AbemaR` = "column-swept-ppr_abema-gradual_Parental-ND_Parental-Abema_Parental-Early-Middle-End_thresh0p001",
+        `Mut AbemaR` = "column-swept-ppr_abema-gradual_Parental-DOX_Parental-Abema_Parental-Early-Middle-End_thresh0p001",
+
+        `WT Vehicle CTR of PalboR` = "column-swept-ppr_palbo-gradual_Parental-ND_Parental-DMSO_Parental-Early-Middle-End_thresh0p001",
+        `Mut Vehicle CTR of PalboR` = "column-swept-ppr_palbo-gradual_Parental-DOX_Parental-DMSO_Parental-Early-Middle-End_thresh0p001",
+        `WT Vehicle CTR of AbemaR` = "column-swept-ppr_abema-gradual_Parental-ND_Parental-DMSO_Parental-Early-Middle-End_thresh0p001",
+        `Mut Vehicle CTR of AbemaR` = "column-swept-ppr_abema-gradual_Parental-DOX_Parental-DMSO_Parental-Early-Middle-End_thresh0p001",
+      )
+    ) |>
+    dplyr::mutate(
+      metadata_plt = forcats::fct_relevel(
+        metadata_plt,
+
+        "WT Vehicle CTR of PalboR",
+        "Mut Vehicle CTR of PalboR",
+        "WT PalboR",
+        "Mut PalboR",
+
+        "WT Vehicle CTR of AbemaR",
+        "Mut Vehicle CTR of AbemaR",
+        "WT AbemaR",
+        "Mut AbemaR"
+      )
+    ) |>
+    dplyr::distinct(
+      metadata_plt,
+      plot_bioreplicate_id,
+      timepoint,
+      normalized_kl_divergence
+    ) |>
+    dplyr::mutate(
+      plot_bioreplicate_id = gsub("Bioreplicate ", "", plot_bioreplicate_id)
+    ) |>
+    dplyr::rename(`Bioreplicate` = plot_bioreplicate_id)
+
+  if (!is.null(filter_timepoint)) {
+    d_plt <- d_plt |> dplyr::filter(timepoint %in% filter_timepoint)
+  }
+
+  plt <- d_plt |>
+    ggplot(ggplot2::aes(
+      x = metadata_plt,
+      y = normalized_kl_divergence,
+      color = Bioreplicate
+    )) +
+    geom_point(position = position_dodge2(.4)) +
+    ylim(0, 1.2) +
+    labs(
+      title = "Clonal prevalence across resistant clusters",
+      subtitle = paste0(filter_timepoint, collapse = "-"),
+      x = NULL,
+      y = "Normalized KL divergence of cluster distribution\nagainst discrete uniform distribution"
+    ) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+  # -------------------------------------------------------------------------
+
+  # Run an ANOVA across all categories.
+  anova_res <- anova(lm(normalized_kl_divergence ~ metadata_plt, data = d_plt))
+  anova_subtitle <- sprintf(
+    "(F(%i,%i)=%.2f; p=%.2e)",
+    anova_res$Df[[1]],
+    anova_res$Df[[2]],
+    anova_res$`F value`[[1]],
+    anova_res$`Pr(>F)`[[1]]
+  )
+
+  res_ttests <- d_plt |>
+    ungroup() |> # ungroup or else this breaks pairwise_t_test
+    rstatix::pairwise_t_test(
+      formula = normalized_kl_divergence ~ metadata_plt,
+      detailed = TRUE,
+      pool.sd = FALSE,
+      var.equal = FALSE
+    ) |>
+    rstatix::add_y_position()
+  readr::write_csv(
+    res_ttests |> as_tibble(),
+    file.path(
+      ddir,
+      "entropy-plots",
+      dist_type,
+      sprintf(
+        "kl-divergence-cluster-ttest-%s-%s.csv",
+        paste0(filter_timepoint, collapse = "-"),
+        suffix
+      )
+    )
+  )
+  print(res_ttests, n = 100)
+
+  res_ttests_detailed <- res_ttests |>
+    dplyr::mutate(se_calculated = estimate / statistic) |>
+    dplyr::relocate(se_calculated) |>
+    dplyr::mutate(
+      text_results = sprintf(
+        "(DM=%.2f, 95%% UMCI=[%.2f,%.2f], t(%.2f)=%.2f, padj=%s)", # 95% unadjusted marginal confidence interval for the diff in means
+        estimate,
+        conf.low,
+        conf.high,
+        df,
+        statistic,
+        format.pval(p.adj, digits = 2, eps = 1e-6, scientific = TRUE)
+      )
+    ) |> # caps pvalues at 1e-6
+    dplyr::relocate(text_results) |>
+    dplyr::mutate(
+      conf.low.check = estimate - se_calculated * qt(1 - (0.05 / 2), df = df),
+      .after = conf.low
+    ) |>
+    dplyr::mutate(
+      conf.high.check = estimate + se_calculated * qt(1 - (0.05 / 2), df = df),
+      .after = conf.high
+    ) |>
+    dplyr::mutate(
+      pcheck = 2 * pt(abs(statistic), df = df, lower.tail = FALSE)
+    ) |> # two-sided unadjusted pvalue
+    dplyr::mutate(
+      p.adj.check = p.adjust(pcheck, method = "holm"),
+      .after = "p.adj"
+    ) |>
+    dplyr::relocate(pcheck, .after = p)
+  readr::write_csv(
+    res_ttests_detailed |> as_tibble(),
+    file.path(
+      ddir,
+      "entropy-plots",
+      dist_type,
+      sprintf(
+        "kl-divergence-cluster-ttest-%s-%s-detailed.csv",
+        paste0(filter_timepoint, collapse = "-"),
+        suffix
+      )
+    )
+  )
+  print(file.path(
+    ddir,
+    "entropy-plots",
+    dist_type,
+    sprintf(
+      "kl-divergence-cluster-ttest-%s-%s-detailed.csv",
+      paste0(filter_timepoint, collapse = "-"),
+      suffix
+    )
+  ))
+
+  set.seed(840)
+
+  # Plot significance stars? When just one tested comparison here, adjusted pvalue same as unadjusted.
+  if (padj.signif.stars) {
+    plt <- plt + ggpubr::stat_pvalue_manual(res_ttests, label = "p.adj.signif")
+  }
+
+  ggsave(
+    file.path(
+      odir,
+      "entropy-plots",
+      dist_type,
+      sprintf(
+        "kl-divergence-cluster-%s-%s.pdf",
+        paste0(filter_timepoint, collapse = "-"),
+        suffix
+      )
+    ),
+    plt,
+    width = 5,
+    height = 5
+  )
+  return(plt)
+}
+```
+
+### Plot normalized KL divergences for PalboR clusters (Figure 3H).
+
+```{r}
+plot_kl_divergences_clusters(
+  infiles = c(
+    "data/processed/01-barcoding/fishplots/column-swept-ppr/shannon-kl-divergence-fishplot-alltimepoints-column-swept-ppr_palbo-gradual_Parental-DOX_Parental-Palbo_Parental-Early-Middle-End_thresh0p001.rds",
+    "data/processed/01-barcoding/fishplots/column-swept-ppr/shannon-kl-divergence-fishplot-alltimepoints-column-swept-ppr_palbo-gradual_Parental-ND_Parental-Palbo_Parental-Early-Middle-End_thresh0p001.rds"
+  ),
+  filter_timepoint = "End",
+  suffix = "palbo-gradual-PalboR-samples"
+)
+```
+
+### Plot normalized KL divergences for AbemaR clusters (Figure 3I).
+
+```{r}
+plot_kl_divergences_clusters(
+  infiles = c(
+    "data/processed/01-barcoding/fishplots/column-swept-ppr/shannon-kl-divergence-fishplot-alltimepoints-column-swept-ppr_abema-gradual_Parental-DOX_Parental-Abema_Parental-Early-Middle-End_thresh0p001.rds",
+    "data/processed/01-barcoding/fishplots/column-swept-ppr/shannon-kl-divergence-fishplot-alltimepoints-column-swept-ppr_abema-gradual_Parental-ND_Parental-Abema_Parental-Early-Middle-End_thresh0p001.rds"
+  ),
+  filter_timepoint = "End",
+  suffix = "abema-gradual-AbemaR-samples"
+)
+```
+
+## Load in function to plot barcode overlaps of sample clusters.
+
+```{r}
+#' Plot contingency table of barcode cluster overlaps between two conditions,
+#' including cases where barcodes were filtered out in one of the two samples.
+#'
+#' Clusters correspond exactly to clusters generated in [get_sample_feature_dist_bct_counts()]
+#' and plotted in fishplots from [plot_bct_frac_fishplot()].
+#'
+#' @param infile_counts1 Path to filtered barcode counts for a condition generated from [get_sample_feature_dist_bct_counts()].
+#' @param infile_counts2 Path to filtered barcode counts for a condition generated from [get_sample_feature_dist_bct_counts()].
+#' @param label1 Label for x-axis corresponding to infile_counts1.
+#' @param label2 Label for y-axis corresponding to infile_counts2.
+#' @param dist_type Distance metric used to generate the feature dist and
+#' sample dist matrices from [get_sample_feature_dist_bct_counts()].
+#' @param output_width Plot width (in).
+#' @param output_height Plot height (in).
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_barcode_comparison_scatter <- function(
+  infile_counts1,
+  infile_counts2,
+  label1,
+  label2,
+  dist_type,
+  output_width = 6,
+  output_height = 6,
+  ddir = "data/processed/01-barcoding",
+  odir = "data/processed/01-barcoding"
+) {
+  clustdir <- file.path(odir, "cluster-overlaps")
+  if (!dir.exists(clustdir)) {
+    dir.create(clustdir)
+  }
+  outfile_pdf <- sprintf(
+    file.path(clustdir, dist_type, "cluster-overlaps_%s_vs_%s.pdf"),
+    gsub(".*feature-counts_(.*)\\.tsv", "\\1", infile_counts1),
+    gsub(".*feature-counts_(.*)\\.tsv", "\\1", infile_counts2)
+  )
+
+  counts1 <- readr::read_tsv(infile_counts1, show_col_types = FALSE) |>
+    dplyr::distinct(barcode, predicted_cluster) |>
+    dplyr::group_by(predicted_cluster) |>
+    dplyr::add_count() |>
+    dplyr::mutate(Cluster = sprintf("Cluster %i (N=%i)", predicted_cluster, n))
+
+  counts2 <- readr::read_tsv(infile_counts2, show_col_types = FALSE) |>
+    dplyr::distinct(barcode, predicted_cluster) |>
+    dplyr::group_by(predicted_cluster) |>
+    dplyr::add_count() |>
+    dplyr::mutate(Cluster = sprintf("Cluster %i (N=%i)", predicted_cluster, n))
+
+  dat <- counts1 |>
+    dplyr::full_join(counts2, by = "barcode") |>
+    dplyr::mutate(n.x = case_when(is.na(n.x) ~ 0, .default = n.x)) |>
+    dplyr::mutate(n.y = case_when(is.na(n.y) ~ 0, .default = n.y)) |>
+    dplyr::mutate(
+      Cluster.x = case_when(
+        is.na(Cluster.x) ~ "Filtered out",
+        .default = Cluster.x
+      )
+    ) |>
+    dplyr::mutate(
+      Cluster.y = case_when(
+        is.na(Cluster.y) ~ "Filtered out",
+        .default = Cluster.y
+      )
+    ) |>
+    dplyr::group_by(Cluster.x, Cluster.y, .drop = FALSE) |>
+    dplyr::count() |>
+    dplyr::ungroup() |>
+    tidyr::complete(Cluster.x, Cluster.y, fill = list(n = 0)) # fill in zeros where no barcodes overlap
+
+  (plt <- dat |>
+    ggplot2::ggplot(ggplot2::aes(
+      x = Cluster.x,
+      y = Cluster.y,
+      label = n,
+      fill = (Cluster.x == "Filtered out" | Cluster.y == "Filtered out")
+    )) +
+    ggplot2::geom_tile(color = "black") +
+    ggplot2::geom_text() +
+    ggplot2::labs(title = "Number of shared barcodes", x = label1, y = label2) +
+    ggplot2::scale_y_discrete(limits = rev) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    ) +
+    ggplot2::coord_fixed(ratio = 1) +
+    ggplot2::scale_fill_manual(values = c("white", "lightgray")))
+
+  ggsave(
+    outfile_pdf,
+    plt,
+    height = output_height,
+    width = output_width,
+    create.dir = TRUE
+  )
+  return(plt)
+}
+```
+
+### Mut Vehicle CTR of PalboR and WT Vehicle CTR of PalboR (Supplementary Figure S3A).
+
+```{r}
+plot_barcode_comparison_scatter(
+  infile_counts1 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_palbo-gradual_Parental-DOX_Parental-DMSO_Parental-Early-Middle-End_thresh0p001.tsv",
+  infile_counts2 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_palbo-gradual_Parental-ND_Parental-DMSO_Parental-Early-Middle-End_thresh0p001.tsv",
+  dist_type = "column-swept-ppr",
+  label1 = "Mut Vehicle CTR of PalboR",
+  label2 = "WT Vehicle CTR of PalboR"
+)
+```
+
+### Mut Vehicle CTR of AbemaR and WT Vehicle CTR of AbemaR (Supplementary Figure S3B).
+
+```{r}
+
+plot_barcode_comparison_scatter(
+  infile_counts1 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_abema-gradual_Parental-DOX_Parental-DMSO_Parental-Early-Middle-End_thresh0p001.tsv",
+  infile_counts2 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_abema-gradual_Parental-ND_Parental-DMSO_Parental-Early-Middle-End_thresh0p001.tsv",
+  dist_type = "column-swept-ppr",
+  label1 = "Mut Vehicle CTR of AbemaR",
+  label2 = "WT Vehicle CTR of AbemaR"
+)
+```
+
+### Mut PalboR and WT PalboR (Supplementary Figure S3C).
+
+```{r}
+
+plot_barcode_comparison_scatter(
+  infile_counts1 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_palbo-gradual_Parental-DOX_Parental-Palbo_Parental-Early-Middle-End_thresh0p001.tsv",
+  infile_counts2 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_palbo-gradual_Parental-ND_Parental-Palbo_Parental-Early-Middle-End_thresh0p001.tsv",
+  dist_type = "column-swept-ppr",
+  label1 = "Mut PalboR escalating",
+  label2 = "WT PalboR escalating"
+)
+```
+
+### Mut AbemaR and WT AbemaR (Supplementary Figure S3D).
+
+```{r}
+
+plot_barcode_comparison_scatter(
+  infile_counts1 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_abema-gradual_Parental-DOX_Parental-Abema_Parental-Early-Middle-End_thresh0p001.tsv",
+  infile_counts2 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_abema-gradual_Parental-ND_Parental-Abema_Parental-Early-Middle-End_thresh0p001.tsv",
+  dist_type = "column-swept-ppr",
+  label1 = "Mut AbemaR",
+  label2 = "WT AbemaR"
+)
+```
+
+### WT PalboR and WT AbemaR (Supplementary Figure S3E).
+
+```{r}
+plot_barcode_comparison_scatter(
+  infile_counts1 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_palbo-gradual_Parental-ND_Parental-Palbo_Parental-Early-Middle-End_thresh0p001.tsv",
+  infile_counts2 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_abema-gradual_Parental-ND_Parental-Abema_Parental-Early-Middle-End_thresh0p001.tsv",
+  dist_type = "column-swept-ppr",
+  label1 = "WT PalboR escalating",
+  label2 = "WT AbemaR"
+)
+```
+
+### Mut PalboR and Mut AbemaR (Supplementary Figure S3F).
+
+```{r}
+plot_barcode_comparison_scatter(
+  infile_counts1 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_palbo-gradual_Parental-DOX_Parental-Palbo_Parental-Early-Middle-End_thresh0p001.tsv",
+  infile_counts2 = "data/processed/01-barcoding/feature-counts_column-swept-ppr_abema-gradual_Parental-DOX_Parental-Abema_Parental-Early-Middle-End_thresh0p001.tsv",
+  dist_type = "column-swept-ppr",
+  label1 = "Mut PalboR escalating",
+  label2 = "Mut AbemaR"
+)
+```
+
+## Cluster and plot fishplots of clonal prevalence for Parental, Vehicle controls of and Palbo gradual and AbemaR evolutionary replicates. 
+
+### WT Vehicle CTR of PalboR (Supplementary Figure S3G).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "WT Vehicle CTR of PalboR",
+  .condition = c("Parental", "ND"),
+  .treatment = c("Parental", "DMSO"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+### Mut Vehicle CTR of PalboR (Supplementary Figure S3H).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_palbo-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_palbo-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "Mut Vehicle CTR of PalboR",
+  .condition = c("Parental", "DOX"),
+  .treatment = c("Parental", "DMSO"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+### WT Vehicle CTR of AbemaR (Supplementary Figure S3I).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "WT Vehicle CTR of AbemaR",
+  .condition = c("Parental", "ND"),
+  .treatment = c("Parental", "DMSO"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+### Mut Vehicle CTR of AbemaR (Supplementary Figure S3J).
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+get_sample_feature_dist_bct_counts(
+  infile_meta = "data/raw/01-barcoding/bct-metadata_abema-gradual.tsv",
+  infile_counts = "data/raw/01-barcoding/bct-counts_abema-gradual.tsv",
+  freq_thresh = 0.001,
+  plot_fishplot = TRUE,
+  plt_title = "Mut Vehicle CTR of AbemaR",
+  .condition = c("Parental", "DOX"),
+  .treatment = c("Parental", "DMSO"),
+  dist_metric = "column-swept-ppr"
+)
+```
+
+## Print session info.
+
+```{r}
+sessionInfo()
+```

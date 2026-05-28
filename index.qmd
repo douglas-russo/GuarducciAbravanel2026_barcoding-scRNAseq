@@ -1,0 +1,3 @@
+# Introduction {.unnumbered}
+
+This Quarto book reproduces the plots related to the barcoding and scRNAseq analyses from [Guarducci and Abravanel et al.  (2026)]. Specific plot colors, orientations, dimensions, label names/abbreviations, and row/column orders may differ slightly from paper figures. R package versions may differ from specific versions used in paper analyses.

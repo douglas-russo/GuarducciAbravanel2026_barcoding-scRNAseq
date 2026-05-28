@@ -1,0 +1,3943 @@
+---
+title: "scRNA-seq analyses"
+format: html
+toc-depth: 4
+---
+
+## Preliminaries
+
+Raw and processed scRNAseq files are deposited on GEO under accession number [GSE326012](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE326012). Raw fastqs are used as inputs to nf-core/scrnaseq v2.7.1. We include as processed data R object files (rds) of the following three types:
+
+1. Each individual sample's unfiltered cells. Filename format: scrnaseq-seurat-object-unfiltered-<library name>.rds
+
+2. Each individual sample's QC-metric-filtered cells. Filename format: scrnaseq-seurat-object-qcfiltered-processed-<library name>.rds. Contains predicted cell cycle scores, phase, GLM-PCA embeddings, UMAP-GLM-PCA embeddings, and kmeans clustering assignments in object slots for each sample.
+
+3. All individual sample's QC-metric-filtered cells merged together into a single object. Filename: scrnaseq-seurat-object-qcfiltered-processed-all-samples.rds. Contains predicted cell cycle scores, phase, GLM-PCA embeddings, UMAP-GLM-PCA embeddings, and kmeans clustering on all cells in object slots. The 'orig.ident' column of the 'meta.data' object slot identifies the sample of origin of a cell and matches the "library name" sample-level metadata field. Dimensionality reductions and clustering were done on all merged cells together.
+
+We recommend using pre-computed files from (2) and (3) above for downstream analyses to ensure consistency with paper figures. In cases where preprocessing steps may be computationally intensive or introduce non-deterministic outputs, we load in pre-computed files.
+
+### Load in libraries.
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggrepel)
+library(ggridges)
+library(clustree)
+library(cluster)
+library(fishpond)
+library(Matrix)
+library(SingleCellExperiment)
+library(scSHC)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(limma)
+library(MatrixGenerics)
+library(data.table)
+# library(infercnv) # needs JAGS to be loaded to run
+```
+
+### Create output data, plot folders.
+
+```{r}
+dir.create("data/raw/02-scrnaseq", recursive = TRUE) # input files
+dir.create("data/processed/02-scrnaseq", recursive = TRUE) # output data, plots
+```
+
+### Load in plot color palettes.
+
+```{r}
+pal_orig.ident <- c(
+  "Mut_AbemaR" = "orange",
+  "WT_AbemaR" = "red",
+  "Mut_PalboR" = "lightblue",
+  "WT_PalboR" = "royalblue",
+  "WT_PalboR_Clone" = "purple",
+  "Mut_Vehicle" = "gray85",
+  "WT_Vehicle" = "gray30",
+  "Parental" = "burlywood4"
+)
+
+col_low <- palette.colors(palette = "Okabe-Ito", names = TRUE)[["blue"]]
+col_high <- palette.colors(palette = "Okabe-Ito", names = TRUE)[["orange"]]
+```
+
+## Sample alignment
+
+### Sample SLURM submission script for nf-core/scrnaseq v2.7.1.
+
+```{bash}
+#| eval: false
+
+#!/bin/bash
+#SBATCH --job-name=12-nfcore-scrnaseq
+#SBATCH --mem=30G
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --ntasks-per-node=1
+
+module load singularity
+nextflow run nf-core/scrnaseq \
+  -r 2.7.1 \
+  -profile singularity \
+  -c nextflow.config \
+  --input data/processed/12-nfcore-scrnaseq/cdk46i-scrnaseq-metadata.csv \
+  --fasta hg38.fa \
+  --gtf hg38.gtf.gz \
+  --protocol 10XV3 \
+  --save_reference \
+  --aligner alevin \
+  --skip_emptydrops \
+  -work-dir /path/to/work/directory \
+  --outdir /path/to/output/directory
+```
+
+## Create R objects from alignment outputs, QC, cluster
+
+### Load in function to read in nf-core/scrnaseq outputs into Seurat objects without filtering out any cells.
+
+```{r}
+#' Collect outputs of nf-core scrnaseq alevin-fry via simpleaf quant (sq), load
+#' into a gene x cell matrix, then collapse gene IDs to
+#' gene symbols (summing), following Jeremy Simon's tutorial:
+#'
+#' https://jeremymsimon.github.io/HSPH_scRNA_20241023/HSPH_scRNA_20241023.html#import-alevin-fry-counts-into-r-with-fishpondloadfry
+#'
+#' Note, this keeps all cells without removing any emptyDroplets cells. This
+#' corresponds to individual processed data files per sample of the naming
+#' scheme
+#'
+#' "<GEO-sample-accession-number>_scrnaseq-seurat-object-unfiltered-<sample-name>.rds"
+#'
+#' deposited in GEO.
+#'
+#' @param sample_name One of c(Parental, WT_Vehicle, Mut_Vehicle, WT_PalboR,
+#' WT_PalboR_Clone, Mut_PalboR, WT_AbemaR, Mut_AbemaR)
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Seurat object of unfiltered counts.
+create_count_mtx_from_nfcore_scrnaseq_unfiltered <- function(
+  sample_name,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  idir = sprintf(
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/12-nfcore-scrnaseq/alevin/%s_alevin_results/af_quant",
+    sample_name
+  )
+
+  sample_rna <- loadFry(idir, outputFormat = "snRNA")
+
+  tx2gene <- read.table(
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/12-nfcore-scrnaseq/alevin/salmon/ref/gene_id_to_name.tsv",
+    header = FALSE,
+    sep = "\t",
+    col.names = c("tx", "gene")
+  )
+
+  # Use matrix multiplication to group and sum counts by gene symbol
+  exp.txId <- rownames(counts(sample_rna))
+  exp.geneId <- as.vector(tx2gene$gene[match(exp.txId, tx2gene$tx)])
+  exp.tx.grp <- t(sparse.model.matrix(~ 0 + exp.geneId))
+
+  sample_rna.summarized <- exp.tx.grp %*% counts(sample_rna)
+  rownames(sample_rna.summarized) <- rownames(sample_rna.summarized) |>
+    str_replace_all(".+.geneId", "")
+
+  out <- CreateSeuratObject(counts = sample_rna.summarized)
+  out$orig.ident <- sample_name # for easy merging of all samples later on into a single Seurat object
+
+  saveRDS(
+    out,
+    file.path(
+      ddir,
+      sprintf("scrnaseq-seurat-object-unfiltered-%s.rds", sample_name)
+    )
+  )
+  return(out)
+}
+```
+
+### Read in samples into unfiltered Seurat Objects.
+
+#### Parental 
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "Parental")
+```
+
+#### WT PalboR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "WT_PalboR")
+```
+
+#### Mut PalboR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "Mut_PalboR")
+```
+
+#### WT PalboR Clone
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(
+  sample_name = "WT_PalboR_Clone"
+)
+```
+
+#### WT AbemaR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "WT_AbemaR")
+```
+
+#### Mut AbemaR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "Mut_AbemaR")
+```
+
+#### WT Vehicle
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "WT_Vehicle")
+```
+
+#### Mut Vehicle
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq_unfiltered(sample_name = "Mut_Vehicle")
+```
+
+### Load in function to read in nf-core/scrnaseq outputs into Seurat objects.
+
+```{r}
+#' Collect outputs of nf-core scrnaseq alevin-fry via simpleaf quant (sq), load
+#' into a gene x cell matrix, remove emptyDroplets, then collapse gene IDs to
+#' gene symbols (summing), following Jeremy Simon's tutorial:
+#'
+#' https://jeremymsimon.github.io/HSPH_scRNA_20241023/HSPH_scRNA_20241023.html#import-alevin-fry-counts-into-r-with-fishpondloadfry
+#'
+#' Note, paths will need to be changed to match the location of the
+#' nf-core/scrnaseq run outputs.
+#'
+#' @param sample_name One of c(Parental, WT_Vehicle, Mut_Vehicle, WT_PalboR,
+#' WT_PalboR_Clone, Mut_PalboR, WT_AbemaR, Mut_AbemaR)
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Seurat object of emptyDrops-filtered counts.
+create_count_mtx_from_nfcore_scrnaseq <- function(
+  sample_name,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  # Change prefix of path to alevin output directory of nf-core/scrnaseq output
+  idir = sprintf(
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/12-nfcore-scrnaseq/alevin/%s_alevin_results/af_quant",
+    sample_name
+  )
+
+  sample_rna <- loadFry(idir, outputFormat = "snRNA")
+
+  e.out <- DropletUtils::emptyDrops(counts(sample_rna))
+  is.cell <- e.out$FDR <= 0.01
+  is.cell[is.na(is.cell)] = FALSE
+  table(is.cell)
+
+  # Remove empty droplets
+  gex_q.filt <- sample_rna[, is.cell]
+
+  tx2gene <- read.table(
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/12-nfcore-scrnaseq/alevin/salmon/ref/gene_id_to_name.tsv",
+    header = FALSE,
+    sep = "\t",
+    col.names = c("tx", "gene")
+  )
+
+  # Use matrix multiplication to group and sum counts by gene symbol
+  exp.txId <- rownames(counts(gex_q.filt))
+  exp.geneId <- as.vector(tx2gene$gene[match(exp.txId, tx2gene$tx)])
+  exp.tx.grp <- t(sparse.model.matrix(~ 0 + exp.geneId))
+
+  gex_q.filt.summarized <- exp.tx.grp %*% counts(gex_q.filt)
+  rownames(gex_q.filt.summarized) <- rownames(gex_q.filt.summarized) |>
+    str_replace_all(".+.geneId", "")
+
+  out <- CreateSeuratObject(counts = gex_q.filt.summarized)
+  out$orig.ident <- sample_name # for easy merging of all samples later on into a single Seurat object
+
+  saveRDS(
+    e.out,
+    file.path(ddir, sprintf("simpleaf-quant-emptyDrops-%s.rds", sample_name))
+  )
+  saveRDS(
+    out,
+    file.path(ddir, sprintf("simpleaf-quant-dds-%s.rds", sample_name))
+  )
+  return(out)
+}
+```
+
+#### Parental 
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "Parental")
+```
+
+#### WT PalboR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "WT_PalboR")
+```
+
+#### Mut PalboR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "Mut_PalboR")
+```
+
+#### WT PalboR Clone
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "WT_PalboR_Clone")
+```
+
+#### WT AbemaR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "WT_AbemaR")
+```
+
+#### Mut AbemaR
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "Mut_AbemaR")
+```
+
+#### WT Vehicle
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "WT_Vehicle")
+```
+
+#### Mut Vehicle
+
+```{r}
+#| eval: false
+create_count_mtx_from_nfcore_scrnaseq(sample_name = "Mut_Vehicle")
+```
+
+### Load in function to merge filtered Seurat objects per sample into a single object.
+
+```{r}
+#' Merge Seurat objects of multiple samples, add in percent mitochondrial
+#' genes.
+#'
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns SeuratObject of merged samples.
+merge_seurat_simpleaf <- function(
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  idir = "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-eda"
+  Parental <- readRDS(file.path(idir, "simpleaf-quant-dds-Parental.rds"))
+  WT_Vehicle <- readRDS(file.path(idir, "simpleaf-quant-dds-WT_Vehicle.rds"))
+  Mut_Vehicle <- readRDS(file.path(idir, "simpleaf-quant-dds-Mut_Vehicle.rds"))
+  WT_PalboR <- readRDS(file.path(idir, "simpleaf-quant-dds-WT_PalboR.rds"))
+  WT_PalboR_Clone <- readRDS(file.path(
+    idir,
+    "simpleaf-quant-dds-WT_PalboR_Clone.rds"
+  ))
+  Mut_PalboR <- readRDS(file.path(idir, "simpleaf-quant-dds-Mut_PalboR.rds"))
+  WT_AbemaR <- readRDS(file.path(idir, "simpleaf-quant-dds-WT_AbemaR.rds"))
+  Mut_AbemaR <- readRDS(file.path(idir, "simpleaf-quant-dds-Mut_AbemaR.rds"))
+
+  sce <- merge(
+    Parental,
+    y = c(
+      WT_Vehicle,
+      Mut_Vehicle,
+      WT_PalboR,
+      WT_PalboR_Clone,
+      Mut_PalboR,
+      WT_AbemaR,
+      Mut_AbemaR
+    ),
+    add.cell.ids = c(
+      "Parental",
+      "WT_Vehicle",
+      "Mut_Vehicle",
+      "WT_PalboR",
+      "WT_PalboR_Clone",
+      "Mut_PalboR",
+      "WT_AbemaR",
+      "Mut_AbemaR"
+    ),
+    project = "cdk46i"
+  )
+  sce <- PercentageFeatureSet(
+    sce,
+    pattern = "^MT-",
+    col.name = "percent.mt"
+  )
+  # Ordering for plot panels, legends, etc.
+  sce$orig.ident <- factor(
+    sce$orig.ident,
+    levels = c(
+      "Mut_AbemaR",
+      "WT_AbemaR",
+      "Mut_PalboR",
+      "WT_PalboR",
+      "WT_PalboR_Clone",
+      "Mut_Vehicle",
+      "WT_Vehicle",
+      "Parental"
+    )
+  )
+
+  saveRDS(sce, file.path(ddir, sprintf("simpleaf-quant-dds-allsamples.rds")))
+  return(sce)
+}
+```
+
+### Merge filtered Seurat objects per sample into a single object.
+
+```{r}
+#| eval: false
+merge_seurat_simpleaf()
+```
+
+### Load in function to add QC information to Seurat object of all samples.
+
+```{r}
+#' Plot QC metrics of scRNAseq cells, filter dataset according to given fixed
+#' thresholds.
+#'
+#' Uses fixed thresholds as opposed to something like miseq, as the distribution
+#' of the QC metrics, makes the mixture model miseq uses a poor fit.
+#'
+#' @param thresh_max_percent.mt Maximum percent.mt for which cells are kept.
+#' @param thresh_min_nFeature_RNA Min nFeature_RNA for which cells are kept.
+#' @param thresh_min_nCount_RNA Min nCount_RNA for which cells are kept.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Seurat object of filtered data.
+filter_eda_qc <- function(
+  thresh_max_percent.mt = 25,
+  thresh_min_nFeature_RNA = 100,
+  thresh_min_nCount_RNA = 1e4,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds <- readRDS("data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples.rds")
+
+  # Filter the Seurat object, and write to file.
+  dds <- dds[, dds$percent.mt <= thresh_max_percent.mt]
+  dds <- dds[, dds$nFeature_RNA >= thresh_min_nFeature_RNA]
+  dds <- dds[, dds$nCount_RNA >= thresh_min_nCount_RNA]
+
+  dds <- JoinLayers(dds)
+  dds <- dds[rowSums(dds@assays$RNA@layers$counts) > 0, ] # filter out genes with zero counts across all cells
+
+  saveRDS(
+    dds,
+    file.path(ddir, sprintf("simpleaf-quant-dds-allsamples_filterqc.rds"))
+  )
+  return(dds)
+}
+```
+
+### Add QC information to Seurat object of all samples.
+
+```{r}
+#| eval: false
+filter_eda_qc()
+```
+
+### Calculate GLM-PCA embeddings.
+
+#### R wrapper script to run GLM-PCA step as SLURM arrayed job: R/07-sc-simpleaf-fastglmpca-kraken.R.
+
+This wrapper R script should be put in a file R/07-sc-simpleaf-fastglmpca-kraken.R.
+
+```{r}
+#| eval: false
+
+#' Run scry-glmpca on the merged scrnaseq data separately for each sample.
+#'
+#' This function is computationally intensive, so we recommend running in an
+#' HPC envionment using the sample wrapper R and slurm scripts below.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object of all samples.
+#' @param sids Vector of sample ids to filter object to. Some of
+#' c(Parental, WT_Vehicle, Mut_Vehicle, WT_PalboR, WT_PalboR_Clone,
+#' Mut_PalboR, WT_AbemaR, Mut_AbemaR)
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+simpleaf_scry_glmpca <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc.rds",
+  sids,
+  ddir = "data/processed/07-sc-simpleaf-fastglmpca-kraken",
+  odir = "output/07-sc-simpleaf-fastglmpca-kraken"
+) {
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  dds <- readRDS(infile_seurat_rds)
+
+  dds_sid <- dds[, dds$orig.ident %in% sids]
+  keep <- rowSums(dds_sid@assays$RNA@layers$counts) > 0
+  dds_sid <- dds_sid[keep, ]
+  cts <- LayerData(dds_sid, assay = "RNA", layer = "counts")
+
+  cat(sids, sep = "\n")
+  cat(
+    "Calculating top deviance features usng scry::devianceFeatureSelection",
+    sep = "\n"
+  )
+  set.seed(3857)
+  sce <- scry::devianceFeatureSelection(cts)
+  sce <- sort(sce, decreasing = TRUE)
+  saveRDS(
+    sce,
+    file.path(
+      ddir,
+      sprintf(
+        "scrygenesdeviance_%s_%s.rds",
+        prefix,
+        paste0(sids, collapse = "-")
+      )
+    )
+  )
+  sce_top <- names(sce[1:2500])
+
+  plot(
+    log(sce),
+    type = "l",
+    xlab = "ranked genes",
+    ylab = "binomial deviance",
+    main = "Feature Selection with Deviance"
+  )
+  abline(v = 2500, lty = 2, col = "red")
+
+  cat("Running fastglmpca on top deviance features.", sep = "\n")
+  fastglmpca::set_fastglmpca_threads(16) # change depending on computing resources
+  fit0 <- fastglmpca::init_glmpca_pois(cts[sce_top, ], K = 50)
+  fit <- fastglmpca::fit_glmpca_pois(cts[sce_top, ], fit0 = fit0)
+
+  # Shorten output name if all 8 samples are being run.
+  if (length(unique(sids)) == 8) {
+    saveRDS(
+      fit,
+      file.path(ddir, sprintf("fastglmpca-K50-scrytop2500bydev_%s.rds", prefix))
+    )
+    saveRDS(
+      cts[sce_top, ],
+      file.path(ddir, sprintf("counts-scrytop2500bydev_%s.rds", prefix))
+    )
+  } else {
+    saveRDS(
+      fit,
+      file.path(
+        ddir,
+        sprintf(
+          "fastglmpca-K50-scrytop2500bydev_%s_%s.rds",
+          prefix,
+          paste0(sids, collapse = "-")
+        )
+      )
+    )
+    saveRDS(
+      cts[sce_top, ],
+      file.path(
+        ddir,
+        sprintf(
+          "counts-scrytop2500bydev_%s_%s.rds",
+          prefix,
+          paste0(sids, collapse = "-")
+        )
+      )
+    )
+  }
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+lst = list(
+  c(
+    "Mut_AbemaR",
+    "WT_AbemaR",
+    "Mut_PalboR",
+    "WT_PalboR",
+    "WT_PalboR_Clone",
+    "Mut_Vehicle",
+    "WT_Vehicle",
+    "Parental"
+  ), # all samples together
+  "Mut_AbemaR",
+  "WT_AbemaR",
+  "Mut_PalboR",
+  "WT_PalboR",
+  "WT_PalboR_Clone",
+  "Mut_Vehicle",
+  "WT_Vehicle",
+  "Parental"
+)
+simpleaf_scry_glmpca(sids = lst[[as.numeric(args[[1]])]]) # uses SLURM array index to choose samples
+```
+
+#### Sample SLURM arrayed submission script.
+
+```{bash}
+#| eval: false
+
+#!/bin/bash
+#SBATCH --job-name=07-sc-simpleaf-fastglmpca-kraken
+#SBATCH --time=4:00:00
+#SBATCH --mem=72G
+#SBATCH --ntasks=1
+#SBATCH --array=8
+#SBATCH --cpus-per-task=16
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=logs/07-sc-simpleaf-fastglmpca-kraken_%A-%a.err
+#SBATCH --output=logs/07-sc-simpleaf-fastglmpca-kraken_%A-%a.out
+
+module load R/4.3.2
+
+Rscript R/07-sc-simpleaf-fastglmpca-kraken.R $SLURM_ARRAY_TASK_ID
+```
+
+### Load in function to add GLM-PCA embeddings to Seurat Objects, calculate UMAP embeddings
+
+We use precomputed outputs of the GLM-PCA computation in this step.
+
+```{r}
+#' Merge glmpca embeddings as a slot in a Seurat object of just those cells,
+#' calculate cellcycle phases, umap on the glmpca imputs, and kmeans
+#' clustering on the data.
+#'
+#' @param infile_seurat_rds Path to RDS of Seurat object.
+#' @param infile_seurat_rds Path to rds of GLM-PCA output.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+merge_seurat_glmpca_umap_kmeans_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc.rds",
+  # Paths need to be changed to point to fastglmpca output files.
+  infile_fastglmpca = c(
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle.rds",
+    "/rafalab/drusso/rjlab/cdk46i/data/processed/07-sc-simpleaf-fastglmpca-kraken/fastglmpca-K50-scrytop2500bydev_simpleaf-quant-dds-allsamples_filterqc_Parental.rds"
+  ),
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds_full <- readRDS(infile_seurat_rds)
+  dds_full <- NormalizeData(dds_full) # only for calculating Seurat's cell cycle scoring, not for any other analyses.
+  s.genes <- base::intersect(cc.genes$s.genes, rownames(dds_full))
+  g2m.genes <- base::intersect(cc.genes$g2m.genes, rownames(dds_full))
+  dds_full <- CellCycleScoring(
+    dds_full,
+    s.features = s.genes,
+    g2m.features = g2m.genes,
+    set.ident = FALSE
+  )
+
+  # Loop through GLM-PCA fits, process each separately.
+  for (f in infile_fastglmpca) {
+    prefix <- sprintf(
+      ifelse(
+        grepl("excludecc", f),
+        "%s_excludecc_glmpca-umap-kmeans",
+        "%s_glmpca-umap-kmeans"
+      ),
+      gsub(
+        ".rds",
+        "",
+        gsub("^fastglmpca-K50.*scrytop2500bydev_", "", basename(f))
+      )
+    )
+
+    outfile_rds <- file.path(ddir, sprintf("%s.rds", prefix))
+    outfile_kmeans_output_rds <- file.path(
+      ddir,
+      sprintf("%s_kmeans-output.rds", gsub("_glmpca-umap-kmeans", "", prefix))
+    )
+
+    outfile_plt_inertia_pdf <- file.path(
+      odir,
+      sprintf("%s_kmeans-inertia.pdf", prefix)
+    )
+    outfile_plt_silhouette_pdf <- file.path(
+      odir,
+      sprintf("%s_kmeans-silhouette.pdf", prefix)
+    )
+    outfile_plt_inertia_png <- file.path(
+      odir,
+      sprintf("%s_kmeans-inertia.png", prefix)
+    )
+    outfile_plt_silhouette_png <- file.path(
+      odir,
+      sprintf("%s_kmeans-silhouette.png", prefix)
+    )
+
+    print(outfile_rds)
+    fit <- readRDS(f)
+    dds <- dds_full[, rownames(fit$V)] # only take cells in glm-pca fit from entire dataset.
+
+    # Add the glmpca gene embeddings to the Seurat object
+    dds[["fastglmpca"]] <- CreateDimReducObject(
+      embeddings = fit$V,
+      key = "k_",
+      assay = DefaultAssay(dds)
+    )
+    set.seed(101341)
+
+    set.seed(385)
+    umap.fit <- uwot::umap(fit$V)
+    dds[["umap_fastglmpca"]] <- CreateDimReducObject(
+      embeddings = umap.fit,
+      key = "",
+      assay = DefaultAssay(dds)
+    )
+
+    # kmeans clustering
+    dist.matrix <- dist(Embeddings(dds, reduction = "fastglmpca"))
+
+    lst = purrr::map(2:10, \(k) {
+      print(k)
+
+      # kmeans cluster the glm-pca embeddings
+      clst.kmeans <- kmeans(
+        Embeddings(dds, reduction = "fastglmpca"),
+        k,
+        iter.max = 25,
+        nstart = 25
+      )
+      dds@meta.data <<- dds@meta.data |> # global assignment
+        mutate(!!sym(sprintf("kmeans%s", k)) := clst.kmeans$cluster)
+
+      centers <- clst.kmeans$centers
+      clusters <- clst.kmeans$cluster
+
+      # Calculate inertia
+      # sum of square distances of each point to its closest (assigned) cluster centroid
+      inertia <- sum(
+        (Embeddings(dds, reduction = "fastglmpca") - centers[clusters, ])^2
+      )
+      clst.kmeans$inertia <- inertia
+
+      # Calculate average silhouette score
+      sil <- cluster::silhouette(x = clst.kmeans$cluster, dist = dist.matrix)
+      meansil <- mean(sil[, 3]) # average silhouette width over all cells.
+      clst.kmeans$silhouette <- meansil
+
+      return(clst.kmeans)
+    })
+
+    st = unique(dds$orig.ident)
+    # Inertia and Silhouette scores for choosing a suitable k
+    kmeans_metrics <- tibble(
+      k = 2:10,
+      inertia = purrr::map_dbl(lst, \(x) x$inertia),
+      silhouette = purrr::map_dbl(lst, \(x) x$silhouette)
+    )
+
+    (plt_inertia <- kmeans_metrics |>
+      ggplot(aes(x = k, y = inertia)) +
+      geom_point() +
+      labs(
+        title = "Inertia of kmeans clusterings",
+        subtitle = paste0(st, collapse = " "),
+        x = "Number of kmeans clusters",
+        y = "Inertia (sum of squares)"
+      ) +
+      scale_x_continuous(breaks = 2:10) +
+      theme_bw())
+
+    (plt_silhouette <- kmeans_metrics |>
+      ggplot(aes(x = k, y = silhouette)) +
+      geom_point() +
+      labs(
+        title = "Average silhouette scores of kmeans clusterings",
+        subtitle = paste0(st, collapse = " "),
+        x = "Number of kmeans clusters",
+        y = "Average silhouette score"
+      ) +
+      scale_x_continuous(breaks = 2:10) +
+      theme_bw())
+
+    # Save plots of inertia and silhouette scores
+    ggsave(outfile_plt_inertia_pdf, plt_inertia, width = 6, height = 6)
+    ggsave(outfile_plt_silhouette_pdf, plt_silhouette, width = 6, height = 6)
+    ggsave(
+      outfile_plt_inertia_png,
+      plt_inertia,
+      width = 6,
+      height = 6,
+      units = "in"
+    )
+    ggsave(
+      outfile_plt_silhouette_png,
+      plt_silhouette,
+      width = 6,
+      height = 6,
+      units = "in"
+    )
+
+    # Save seurat objects with kmeans clustering information.
+    saveRDS(lst, outfile_kmeans_output_rds)
+    saveRDS(dds, outfile_rds)
+  }
+}
+```
+
+### Add GLM-PCA embeddings to Seurat Objects, calculate UMAP embeddings.
+
+```{r}
+#| eval: false
+merge_seurat_glmpca_umap_kmeans_simpleaf()
+```
+
+## Plotting downstream analyses
+
+### Load in function to plot GLM-PCA and UMAP-GLM-PCA embeddings for calculated clusters.
+
+```{r}
+#' Plot GLM-PCA and UMAPs of data, and kmeans clusterings.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object with embeddings, kmeans clusterings.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_seurat_glmpca_umap_cluster_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds <- readRDS(infile_seurat_rds)
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+
+  outfile_pdf <- file.path(
+    ddir,
+    sprintf(
+      "%s_glmpca-umap-kmeans.rds",
+      gsub(".rds", "", basename(infile_seurat_rds))
+    )
+  )
+  st = unique(dds$orig.ident)
+
+  meta_glmpca <- Embeddings(dds, reduction = "fastglmpca") |>
+    as.data.frame() |>
+    tibble::rownames_to_column("sid") |>
+    inner_join(
+      dds@meta.data |> as.data.frame() |> tibble::rownames_to_column("sid"),
+      by = "sid"
+    )
+
+  meta_umapglmpca <- Embeddings(dds, reduction = "umap_fastglmpca") |>
+    as.data.frame() |>
+    tibble::rownames_to_column("sid") |>
+    inner_join(
+      dds@meta.data |> as.data.frame() |> tibble::rownames_to_column("sid"),
+      by = "sid"
+    )
+
+  meta_glmpca$zero_fraction = colSums(
+    GetAssayData(dds, layer = "counts") == 0
+  ) /
+    nrow(dds)
+  meta_umapglmpca$zero_fraction = colSums(
+    GetAssayData(dds, layer = "counts") == 0
+  ) /
+    nrow(dds)
+
+  plt_glmpca <- meta_glmpca |>
+    ggplot(aes(x = k_1, y = k_2, col = orig.ident)) +
+    geom_point(alpha = .5, size = .25) +
+    theme_bw() +
+    guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) + # so legend is readable
+    labs(
+      title = "GLM-PCA cell embeddings",
+      subtitle = paste0(st, collapse = " "),
+      x = "GLM-PCA Embedding 1",
+      y = "GLM-PCA Embedding 2"
+    ) +
+    scale_color_manual(values = pal_orig.ident, name = "Condition")
+  ggsave(
+    file.path(odir, sprintf("%s_glmpca-condition.pdf", prefix)),
+    plt_glmpca,
+    width = 7,
+    height = 6
+  )
+  ggsave(
+    file.path(odir, sprintf("%s_glmpca-condition.png", prefix)),
+    plt_glmpca,
+    width = 7,
+    height = 6,
+    units = "in"
+  )
+
+  plt_glmpca_phase <- meta_glmpca |>
+    ggplot(aes(x = k_1, y = k_2, col = Phase)) +
+    geom_point(alpha = .5, size = .25) +
+    theme_bw() +
+    guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) + # so legend is readable
+    labs(
+      title = "GLM-PCA cell embeddings",
+      subtitle = paste0(st, collapse = " "),
+      x = "GLM-PCA Embedding 1",
+      y = "GLM-PCA Embedding 2"
+    )
+  ggsave(
+    file.path(odir, sprintf("%s_glmpca-phase.pdf", prefix)),
+    plt_glmpca_phase,
+    width = 7,
+    height = 6
+  )
+  ggsave(
+    file.path(odir, sprintf("%s_glmpca-phase.png", prefix)),
+    plt_glmpca_phase,
+    width = 7,
+    height = 6,
+    units = "in"
+  )
+
+  (plt_umapglmpca <- meta_umapglmpca |>
+    ggplot(aes(
+      x = !!sym(colnames(Embeddings(dds, reduction = "umap_fastglmpca"))[[1]]),
+      y = !!sym(colnames(Embeddings(dds, reduction = "umap_fastglmpca"))[[2]]),
+      col = orig.ident
+    )) +
+    geom_point(alpha = .5, size = .25) +
+    theme_bw() +
+    guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) + # so legend is readable
+    labs(
+      title = "UMAP on GLM-PCA cell embeddings",
+      subtitle = paste0(st, collapse = " "),
+      x = "UMAP-GLM-PCA Embedding 1",
+      y = "UMAP-GLM-PCA Embedding 2"
+    ) +
+    scale_color_manual(values = pal_orig.ident, name = "Condition"))
+  print(plt_umapglmpca)
+  ggsave(
+    file.path(odir, sprintf("%s_umap-condition.pdf", prefix)),
+    plt_umapglmpca,
+    width = 7,
+    height = 6
+  )
+  ggsave(
+    file.path(odir, sprintf("%s_umap-condition.png", prefix)),
+    plt_umapglmpca,
+    width = 7,
+    height = 6,
+    units = "in"
+  )
+
+  print(
+    plt_umapglmpca_phase <- meta_umapglmpca |>
+      ggplot(aes(
+        x = !!sym(colnames(Embeddings(dds, reduction = "umap_fastglmpca"))[[
+          1
+        ]]),
+        y = !!sym(colnames(Embeddings(dds, reduction = "umap_fastglmpca"))[[
+          2
+        ]]),
+        col = Phase
+      )) +
+      geom_point(alpha = .5, size = .25) +
+      theme_bw() +
+      guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) + # so legend is readable
+      labs(
+        title = "UMAP on GLM-PCA cell embeddings",
+        subtitle = paste0(st, collapse = " "),
+        x = "UMAP-GLM-PCA Embedding 1",
+        y = "UMAP-GLM-PCA Embedding 2"
+      )
+  )
+  ggsave(
+    file.path(odir, sprintf("%s_umap-phase.pdf", prefix)),
+    plt_umapglmpca_phase,
+    width = 7,
+    height = 6
+  )
+  ggsave(
+    file.path(odir, sprintf("%s_umap-phase.png", prefix)),
+    plt_umapglmpca_phase,
+    width = 7,
+    height = 6,
+    units = "in"
+  )
+
+  # Clustree diagram of kmeans clustering
+  plt_clustree_kmeans <- clustree::clustree(dds, prefix = "kmeans") +
+    labs(
+      title = sprintf(
+        "kmeans clustering Resolutions %s",
+        paste0(gsub(" ", "-", st), collapse = "-")
+      )
+    )
+  print(plt_clustree_kmeans)
+  ggsave(
+    file.path(odir, sprintf("%s_kmeans-clustree.pdf", prefix)),
+    plt_clustree_kmeans,
+    width = 8,
+    height = 12
+  )
+  ggsave(
+    file.path(odir, sprintf("%s_kmeans-clustree.png", prefix)),
+    plt_clustree_kmeans,
+    width = 8,
+    height = 12,
+    units = "in"
+  )
+
+  # Make plots for all kmeans, adding in cluster size information.
+  for (i in stringr::str_c("kmeans", 2:10)) {
+    plt_pca_kmeans_cluster <- # PC1 against PC2
+      meta_glmpca |>
+      group_by(!!sym(i)) |>
+      add_count() |>
+      mutate(!!sym(i) := str_c(!!sym(i), " (N = ", n, ")")) |>
+      ggplot(aes(x = k_1, y = k_2, col = factor(!!sym(i)))) +
+      geom_point(alpha = .5, size = .5) +
+      theme_bw() +
+      guides(color = guide_legend(override.aes = list(size = 2))) +
+      labs(
+        title = "GLM-PCA cell embeddings",
+        subtitle = sprintf(
+          "%s; kmeans clustering %s",
+          paste0(st, collapse = " "),
+          i
+        ),
+        x = "GLM-PCA Embedding 1",
+        y = "GLM-PCA Embedding 2"
+      )
+
+    plt_umap_kmeans_clusters <- meta_umapglmpca |>
+      group_by(!!sym(i)) |>
+      add_count() |>
+      mutate(!!sym(i) := str_c(!!sym(i), " (N = ", n, ")")) |>
+      ggplot(aes(
+        x = !!sym(colnames(Embeddings(dds, reduction = "umap_fastglmpca"))[[
+          1
+        ]]),
+        y = !!sym(colnames(Embeddings(dds, reduction = "umap_fastglmpca"))[[
+          2
+        ]]),
+        col = factor(!!sym(i))
+      )) +
+      geom_point(alpha = .5, size = .5) +
+      theme_bw() +
+      guides(color = guide_legend(override.aes = list(size = 2))) +
+      labs(
+        title = "UMAP on GLM-PCA cell embeddings",
+        subtitle = sprintf(
+          "%s; kmeans clustering %s",
+          paste0(st, collapse = " "),
+          i
+        ),
+        x = "UMAP-GLM-PCA Embedding 1",
+        y = "UMAP-GLM-PCA Embedding 2"
+      )
+    print(plt_umap_kmeans_clusters)
+
+    ggsave(
+      file.path(odir, sprintf("%s_glmpca_%s.pdf", prefix, i)),
+      plt_pca_kmeans_cluster,
+      width = 7,
+      height = 6
+    )
+    ggsave(
+      file.path(odir, sprintf("%s_umap_%s.pdf", prefix, i)),
+      plt_umap_kmeans_clusters,
+      width = 7,
+      height = 6
+    )
+
+    ggsave(
+      file.path(odir, sprintf("%s_glmpca_%s.png", prefix, i)),
+      plt_pca_kmeans_cluster,
+      width = 7,
+      height = 6,
+      units = "in"
+    )
+    ggsave(
+      file.path(odir, sprintf("%s_umap_%s.png", prefix, i)),
+      plt_umap_kmeans_clusters,
+      width = 7,
+      height = 6,
+      units = "in"
+    )
+  }
+}
+```
+
+### Plot GLM-PCA and UMAP-GLM-PCA embeddings for calculated clusters, coloring clusters by sample name or kmeans cluster. 
+
+These function calls plot GLM-PCA, UMAP-GLM-PCA embeddings of cells for specified samples, as well as the clustree diagram of kmeans clustering values, silhouette score plots.
+
+#### All samples (Figures 6A, 6B).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Parental (Figure 6E).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT PalboR (Figure 6F).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut PalboR (Figure 6G).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT PalboR Clone (Figure 6H).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT AbemaR (Figure 6I).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut AbemaR (Figure 6J).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT Vehicle (Supplementary Figure S7D).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut Vehicle (Supplementary Figure S7E).
+
+```{r}
+plot_seurat_glmpca_umap_cluster_simpleaf(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+### Load in function to plot barplot of proportions of cell cycle phases per sample.
+
+```{r}
+#' Plot a barplot of the proportion of cells in each predicted Seurat cell
+#' cycle phase per sample.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object of all samples.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns ggplot2 object of the cell cycle phase barplot.
+plot_cell_cycle_barplot_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  dds <- readRDS(infile_seurat_rds)
+
+  (plt <- dds@meta.data |>
+    ggplot(aes(x = orig.ident, fill = Phase)) +
+    geom_bar(position = "fill") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    labs(
+      x = NULL,
+      y = "Proportion of cells",
+      title = "Seurat cell cycle scoring predicted class counts"
+    ))
+
+  ggsave(
+    file.path(
+      odir,
+      sprintf("%s_seurat-cell-cycle-scoring_barplot.pdf", prefix)
+    ),
+    plt,
+    height = 5,
+    width = 5
+  )
+  return(plt)
+}
+```
+
+### Plot cell cycle phase proportions per sample (Figure 6C).
+
+```{r}
+plot_cell_cycle_barplot_simpleaf()
+```
+
+### Load in function to plot cell-cell distances within each sample.
+
+```{r}
+#' Per sample, calculate matrices of cell-cell Euclidean distances on GLM-PCA
+#' cell embeddings for 1000 sampled cells.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object of all samples.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+get_cell_cell_dists_within_sample_fastglmpca_embeddings_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  dds <- readRDS(infile_seurat_rds)
+  Idents(dds) <- "orig.ident"
+
+  gene.embedding.tbl <- Embeddings(dds, "fastglmpca") |>
+    as.data.frame() |>
+    tibble::rownames_to_column("barcode_id") |>
+    tibble::as_tibble()
+
+  gene.embedding.tbl.meta <- dds@meta.data |>
+    tibble::rownames_to_column("barcode_id") |>
+    inner_join(gene.embedding.tbl, by = "barcode_id") |>
+    group_by(orig.ident)
+
+  set.seed(214)
+  dists <- group_split(gene.embedding.tbl.meta) |>
+    purrr::map(\(df) {
+      df |>
+        tibble::column_to_rownames("barcode_id") |>
+        dplyr::select(k_1:k_50) |>
+        dplyr::slice_sample(n = 1000) |>
+        dist(method = "euclidean")
+    })
+
+  dists.tbl <- dists |>
+    purrr::map(\(df) {
+      ds <- df |> as.matrix()
+      ds[upper.tri(ds, diag = TRUE)] <- NA
+      ds |>
+        as.data.frame() |>
+        tibble::rownames_to_column("barcode_id_1") |>
+        pivot_longer(
+          !barcode_id_1,
+          names_to = "barcode_id_2",
+          values_to = "dist"
+        ) |>
+        dplyr::filter(!is.na(dist))
+    })
+
+  dist.tbl.meta <- dists.tbl |>
+    purrr::list_rbind() |>
+    left_join(
+      dds@meta.data |>
+        tibble::rownames_to_column("barcode_id") |>
+        tibble::as_tibble(),
+      by = c("barcode_id_1" = "barcode_id")
+    )
+
+  boxplt <- dist.tbl.meta |>
+    ggplot(aes(x = orig.ident, y = dist, fill = orig.ident)) +
+    geom_boxplot() +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      legend.position = 'none'
+    ) +
+    labs(
+      title = "Cell-cell Euclidean distances on GLM-PCA embeddings",
+      y = "Euclidean distance",
+      subtitle = "1000 random cells per sample",
+      x = NULL
+    ) +
+    scale_fill_manual(values = pal_orig.ident)
+
+  ggsave(
+    file.path(
+      odir,
+      sprintf("%s_cell-cell-dists-boxplot-1000sampled.pdf", prefix)
+    ),
+    boxplt,
+    height = 6,
+    width = 6
+  )
+  ggsave(
+    file.path(
+      odir,
+      sprintf("%s_cell-cell-dists-boxplot-1000sampled.png", prefix)
+    ),
+    boxplt,
+    height = 6,
+    width = 6
+  )
+
+  print(boxplt)
+}
+```
+
+### Plot cell-cell distances within each sample (Supplementary Figure S7A).
+
+```{r}
+get_cell_cell_dists_within_sample_fastglmpca_embeddings_simpleaf()
+```
+
+### Load in function to plot dotplot of expression of specific genes per sample.
+
+```{r}
+#' Plot dotplot of specific CNV related genes for all samples.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object of all samples.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_markers_cnv_genes_dotplots_per_sample_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  # Contains genes (gene_id), annotations (Function) listed in Supplementary Figure S7B
+  cnvgenes <- readxl::read_xlsx(
+    "/rafalab/drusso/rjlab/cdk46i/data/raw/CNV_ordered_gene_list_19-11-24.xlsx",
+    col_names = FALSE
+  )
+  names(cnvgenes) <- c("Function", "gene_id")
+  cnvgenes <- cnvgenes |>
+    fill(Function, .direction = "down")
+
+  cnvgenes |> print(n = 100)
+
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  dds <- readRDS(infile_seurat_rds)
+
+  Idents(dds) <- "orig.ident"
+  (plt <- DotPlot(dds, cnvgenes$gene_id)$data |>
+    inner_join(cnvgenes, by = c("features.plot" = "gene_id")) |>
+    tibble::rownames_to_column("gid") |>
+    dplyr::mutate(
+      orig.ident = forcats::fct_relevel(
+        id,
+        "Mut_AbemaR",
+        "WT_AbemaR",
+        "Mut_PalboR",
+        "WT_PalboR",
+        "WT_PalboR_Clone",
+        "Mut_Vehicle",
+        "WT_Vehicle",
+        "Parental"
+      )
+    ) |>
+    ggplot(aes(
+      x = orig.ident,
+      y = features.plot,
+      col = avg.exp.scaled,
+      size = pct.exp
+    )) +
+    geom_point() +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      strip.text.y = element_text(angle = 0),
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+    ) +
+    scale_color_gradient(
+      low = "lightgray",
+      high = "blue",
+      name = "Average Expression"
+    ) +
+    scale_radius(
+      range = c(0, 3),
+      limits = c(NA, NA),
+      name = "Percent Expressed"
+    ) +
+    labs(
+      title = "Marker expressions by sample",
+      x = NULL,
+      y = NULL
+    ) +
+    facet_grid(rows = vars(Function), scales = "free", space = "free_y"))
+
+  ggsave(
+    file.path(odir, sprintf("%s_dotplot_cnvgenes.pdf", prefix)),
+    plt,
+    width = 7,
+    height = 12
+  )
+
+  return(plt)
+}
+```
+
+### Plot dotplot of expression of specific genes per sample (Supplementary Figure S7B).
+
+```{r}
+#| fig-width: 8
+#| fig-height: 11
+plot_markers_cnv_genes_dotplots_per_sample_simpleaf()
+```
+
+## Gene set testing 
+
+### Estimate genewise dispersions and expression rates per sample.
+
+```{r}
+#' Calculate genewise dispersions (phi) per each of the 8 samples.
+#'
+#' These dispersions get used in calculating the Wald statistic of the difference
+#' in average expression between groups when doing differential expression and
+#' gene set testing.
+#'
+#' We allow each sample to have its own genewise dispersions, as these may
+#' differ among the 8 samples.
+#'
+#' @param infile_seurat_rds Path to Seurat object rds.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of overdispersion and rate (lambda) terms per gene, per sample.
+get_genewise_rates_and_dispersions_per_sample <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds <- readRDS(infile_seurat_rds)
+  cts <- SeuratObject::GetAssayData(dds, layer = "counts")
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+
+  phi_df <- c(
+    "Mut_AbemaR",
+    "WT_AbemaR",
+    "Mut_PalboR",
+    "WT_PalboR",
+    "WT_PalboR_Clone",
+    "Mut_Vehicle",
+    "WT_Vehicle",
+    "Parental"
+  ) |>
+    purrr::map_dfr(\(b) {
+      cts <- SeuratObject::GetAssayData(
+        dds[, dds$orig.ident == b],
+        layer = "counts"
+      ) # gene x cells orientation
+      n <- Matrix::colSums(cts)
+      N <- sum(n)
+      lam <- Matrix::rowSums(cts) / N # gene-specific rates
+      rates <- outer(lam, n)
+      phi <- Matrix::rowSums((cts - rates)^2 / rates) / (ncol(cts) - 1) # estimated dispersion
+      stat <- lam / sqrt(pmin(phi, 1) * lam)
+
+      phi |>
+        as.data.frame() |>
+        cbind(lam) |>
+        cbind(stat) |>
+        tibble::rownames_to_column("gene") |>
+        dplyr::mutate(N_reads = N) |>
+        dplyr::mutate(N_cells = ncol(cts)) |>
+        dplyr::mutate(orig.ident = b)
+    })
+
+  readr::write_csv(
+    phi_df,
+    file.path(ddir, sprintf("genewise-overdispersions_%s.csv", prefix))
+  )
+  saveRDS(
+    phi_df,
+    file.path(ddir, sprintf("genewise-overdispersions_%s.rds", prefix))
+  )
+
+  return(phi_df)
+}
+```
+
+```{r}
+get_genewise_rates_and_dispersions_per_sample()
+```
+
+### Estimate genewise expression rates within cell cycle phases per sample.
+
+```{r}
+#' Calculate gene rates within each cell cycle phase for each sample.
+#'
+#' These rates will be used for ranking genes and gene set testing across samples,
+#' but subsetted to just within-the same cell cycle phases.
+#'
+#' @param infile_seurat_rds Path to Seurat object rds.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of rate (lambda) terms per gene, per sample, per cell cycle phase.
+get_genewise_rates_per_phase_within_sample <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds <- readRDS(infile_seurat_rds)
+  cts <- SeuratObject::GetAssayData(dds, layer = "counts")
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+
+  lam_df <- c(
+    "Mut_AbemaR",
+    "WT_AbemaR",
+    "Mut_PalboR",
+    "WT_PalboR",
+    "WT_PalboR_Clone",
+    "Mut_Vehicle",
+    "WT_Vehicle",
+    "Parental"
+  ) |>
+    purrr::map_dfr(\(b) {
+      c("S", "G1", "G2M") |>
+        purrr::map_dfr(\(ph) {
+          cts <- SeuratObject::GetAssayData(
+            dds[, (dds$orig.ident == b & dds$Phase == ph)],
+            layer = "counts"
+          ) # gene x cells orientation
+          n <- Matrix::colSums(cts)
+          N <- sum(n)
+          lam <- Matrix::rowSums(cts) / N # gene-specific rates
+
+          lam |>
+            as.data.frame() |>
+            tibble::rownames_to_column("gene") |>
+            dplyr::mutate(N_reads = N) |>
+            dplyr::mutate(N_cells = ncol(cts)) |>
+            dplyr::mutate(orig.ident = b) |>
+            dplyr::mutate(Phase = ph)
+        })
+    })
+
+  readr::write_csv(
+    lam_df,
+    file.path(
+      ddir,
+      sprintf("genewise-rates-within-phase-per-sample_%s.csv", prefix)
+    )
+  )
+  saveRDS(
+    lam_df,
+    file.path(
+      ddir,
+      sprintf("genewise-rates-within-phase-per-sample_%s.rds", prefix)
+    )
+  )
+  return(lam_df)
+}
+```
+
+```{r}
+get_genewise_rates_per_phase_within_sample()
+```
+
+### Estimate genewise expression rates within clusters per sample.
+
+```{r}
+#' Calculate genewise expression rates per each kmeans cluster for the given
+#' sample.
+#'
+#' These rates get used in calculating the Wald statistic of the difference
+#' in average expression between groups when doing differential expression and
+#' gene set testing.
+#'
+#' @param infile_seurat_rds Path to Seurat object rds of a single sample.
+#' @param cluster_var Integer of which kmeans clustering (2 to 10) to use.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of gene expression rates per gene, per sample.
+get_genewise_rates_per_cluster_within_sample <- function(
+  infile_seurat_rds,
+  cluster_var,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds <- readRDS(infile_seurat_rds)
+  cts <- SeuratObject::GetAssayData(dds, layer = "counts")
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+
+  orig.ident <- unique(dds$orig.ident)
+
+  lam_df <- 1:cluster_var |>
+    purrr::map_dfr(\(x) {
+      cts <- SeuratObject::GetAssayData(
+        dds[,
+          dds@meta.data |> pull(!!sym(sprintf("kmeans%i", cluster_var))) == x
+        ],
+        layer = "counts"
+      ) # gene x cells orientation
+      n <- Matrix::colSums(cts)
+      N <- sum(n)
+      lam <- Matrix::rowSums(cts) / N # gene-specific rates
+
+      lam |>
+        as.data.frame() |>
+        tibble::rownames_to_column("gene") |>
+        dplyr::mutate(N_reads = N) |>
+        dplyr::mutate(N_cells = ncol(cts)) |>
+        dplyr::mutate(orig.ident = orig.ident) |>
+        dplyr::mutate(kmclust = sprintf("kmeans%i", cluster_var)) |>
+        dplyr::mutate(cluster = x)
+    })
+
+  readr::write_csv(
+    lam_df,
+    file.path(
+      ddir,
+      sprintf("genewise-rates-within-kmeans%i_%s.csv", cluster_var, prefix)
+    )
+  )
+  saveRDS(
+    lam_df,
+    file.path(
+      ddir,
+      sprintf("genewise-rates-within_kmeans%i_%s.rds", cluster_var, prefix)
+    )
+  )
+  return(lam_df)
+}
+```
+
+#### Parental
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### WT PalboR
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### Mut PalboR
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### WT PalboR Clone
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### WT AbemaR
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### Mut AbemaR
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### WT Vehicle
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+#### Mut Vehicle
+
+```{r}
+#| output: false
+purrr::map(c(2,3), \(x) {
+  get_genewise_rates_per_cluster_within_sample(
+    infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds",
+    cluster_var = x)
+})
+```
+
+### Estimate genewise expression rates within cell cycle phases within clusters per sample.
+
+```{r}
+#' Calculate genewise rates per each cell cycle phase within each kmeans 
+#' cluster for the given sample.
+#'
+#' These rates get used in calculating the Wald statistic of the difference
+#' in average expression between groups when doing differential expression and
+#' gene set testing.
+#'
+#' @param infile_seurat_rds Path to Seurat object rds of a single sample.
+#' @param cluster_var 
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of gene expression rates per gene, 
+#' within cluster within cell cycle phase for a single sample.
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample <- function(
+  infile_seurat_rds,
+  cluster_var,
+  min_cells = 50,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dds <- readRDS(infile_seurat_rds)
+  cts <- SeuratObject::GetAssayData(dds, layer = "counts")
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+
+  lam_df <- 1:cluster_var |>
+    purrr::map(\(x) {
+      purrr::map(c("G1", "G2M", "S"), \(phase) { # cell cycle phase within cluster
+        print(sprintf(
+          "%s:%s %i",
+          x,
+          phase,
+          sum(
+            ((dds@meta.data |> pull(!!sym(sprintf("kmeans%i", cluster_var))) ==
+              x) &
+              (dds$Phase == phase))
+          )
+        ))
+
+        if (
+          sum(
+            (dds@meta.data |> pull(!!sym(sprintf("kmeans%i", cluster_var))) ==
+              x) &
+              (dds$Phase == phase)
+          ) <
+            min_cells
+        ) {
+          return(NULL) # too few cells to calculate rate confidently
+        }
+
+        cts <- SeuratObject::GetAssayData(
+          dds[,
+            ((dds@meta.data |> pull(!!sym(sprintf("kmeans%i", cluster_var))) ==
+              x) &
+              (dds$Phase == phase))
+          ],
+          layer = "counts"
+        ) # gene x cells orientation
+        n <- Matrix::colSums(cts)
+        N <- sum(n)
+        lam <- Matrix::rowSums(cts) / N # gene-specific rates
+
+        lam |>
+          as.data.frame() |>
+          tibble::rownames_to_column("gene") |>
+          dplyr::mutate(N_reads = N) |>
+          dplyr::mutate(N_cells = ncol(cts)) |>
+          dplyr::mutate(orig.ident = unique(dds$orig.ident)) |>
+          dplyr::mutate(kmclust = sprintf("kmeans%i", cluster_var)) |>
+          dplyr::mutate(cluster = x) |>
+          dplyr::mutate(phase = phase) |>
+          dplyr::mutate(cluster_phase = sprintf("%s:%s", cluster, phase))
+      }) |>
+        purrr::list_rbind()
+    }) |>
+    purrr::list_rbind() |>
+    dplyr::filter(N_cells >= min_cells) # require at least min_cells cells to confidently call rate within a cluster
+
+  readr::write_csv(
+    lam_df,
+    file.path(
+      ddir,
+      sprintf(
+        "genewise-rates-within-kmeans%i-within-phase_geq%icells_%s.csv",
+        cluster_var,
+        min_cells,
+        prefix
+      )
+    )
+  )
+  saveRDS(
+    lam_df,
+    file.path(
+      ddir,
+      sprintf(
+        "genewise-rates-within_kmeans%i-within-phase_geq%icells_%s.rds",
+        cluster_var,
+        min_cells,
+        prefix
+      )
+    )
+  )
+  return(lam_df)
+}
+```
+
+#### Parental
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds",
+  cluster_var = 3)
+```
+
+#### WT PalboR
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds",
+  cluster_var = 3)
+```
+
+#### Mut PalboR
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds",
+  cluster_var = 3)
+```
+
+#### WT PalboR Clone
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds",
+  cluster_var = 3)
+```
+
+#### WT AbemaR
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds",
+  cluster_var = 2)
+```
+
+#### Mut AbemaR
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds",
+  cluster_var = 2)
+```
+
+#### WT Vehicle
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds",
+  cluster_var = 2)
+```
+
+#### Mut Vehicle
+
+```{r}
+#| output: false
+get_genewise_rates_per_cluster_per_cell_cycle_phase_within_sample(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds",
+  cluster_var = 2)
+```
+
+### Calculate quasi-Poisson Wald statistics comparing two samples at a time.
+
+```{r}
+#' Calculate the Wald statistic in a quasiPoisson glm that compares two 
+#' samples at a time per gene.
+#'
+#' Uses the sample-specific, per-gene estimated dispersions calculated above
+#' as part of the standard error of the tested coefficient in the QP glm.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object.
+#' @param infile_dispersions Path to rds of estimated genewise dispersion per 
+#' sample.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of Wald statistics comparing samples and sample 
+#' specific expression rates and dispersion estimates.
+quasipoisson_glm_de_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  infile_dispersions = "data/processed/02-scrnaseq/genewise-overdispersions_simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  disps <- readRDS(infile_dispersions)
+
+  disps_A = disps |> filter(orig.ident == "Mut_AbemaR")
+  disps_B = disps |> filter(orig.ident == "WT_AbemaR")
+  stopifnot(all(disps_A$gene == disps_B$gene))
+
+  disps_wide <- disps |>
+    pivot_wider(
+      id_cols = gene,
+      names_from = orig.ident,
+      values_from = c("phi", "lam", "stat", "N_cells", "N_reads")
+    )
+
+  nms <- c(
+    "Mut_AbemaR",
+    "WT_AbemaR",
+    "Mut_PalboR",
+    "WT_PalboR",
+    "WT_PalboR_Clone",
+    "Mut_Vehicle",
+    "WT_Vehicle",
+    "Parental"
+  )
+  tidyr::expand_grid(x = nms, y = nms) |>
+    dplyr::filter(x != y) |>
+    purrr::pwalk(\(x, y) {
+      disps_wide <<- disps_wide |> # global assignment
+        dplyr::mutate(
+          !!sym(sprintf("waldstat_%s_minus_%s", x, y)) := ((log(
+            !!sym(sprintf("lam_%s", x))
+          ) -
+            log(!!sym(sprintf("lam_%s", y)))) /
+            sqrt(
+              (pmax(1, !!sym(sprintf("phi_%s", x))) /
+                (!!sym(sprintf("lam_%s", x)) *
+                  !!sym(sprintf("N_reads_%s", x)))) +
+                (pmax(1, !!sym(sprintf("phi_%s", y))) /
+                  (!!sym(sprintf("lam_%s", y)) *
+                    !!sym(sprintf("N_reads_%s", y))))
+            ))
+        )
+    })
+
+  saveRDS(
+    disps_wide,
+    file.path(
+      ddir,
+      sprintf("waldstat-ranked-genes-across-samples_%s.rds", prefix)
+    )
+  )
+  return(disps_wide)
+}
+```
+
+```{r}
+quasipoisson_glm_de_simpleaf()
+```
+
+### Calculate quasi-Poisson Wald statistics comparing two samples within a cell cycle phase at a time.
+
+```{r}
+#' Calculate the Wald statistic in a quasiPoisson glm that compares two 
+#' samples at a time within a cell cycle phase per gene.
+#'
+#' Uses the sample-specific, per-gene estimated dispersions calculated above
+#' as part of the standard error of the tested coefficient in the QP glm.
+#'
+#' @param infile_seurat_rds Path to rds of genewise expression rates within a 
+#' cell cycle phase per all samples.
+#' @param infile_dispersions Path to rds of estimated genewise dispersion per 
+#' sample.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of Wald statistics comparing samples within a cell 
+#' cycle phase and (sample and cell cycle phase) specific expression rates and 
+#' sample specific dispersion estimates.
+quasipoisson_glm_de_across_samples_within_phase_simpleaf <- function(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within-phase-per-sample_simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  infile_dispersions = "data/processed/02-scrnaseq/genewise-overdispersions_simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_rates))
+  rates <- readRDS(infile_rates)
+  disps <- readRDS(infile_dispersions)
+
+  rates_wide <- rates |>
+    dplyr::left_join(
+      disps |> dplyr::select(gene, phi, orig.ident),
+      by = c("gene", "orig.ident")
+    ) |>
+    tidyr::pivot_wider(
+      id_cols = gene,
+      names_from = c("orig.ident", "Phase"),
+      values_from = c("lam", "N_reads", "N_cells", "phi")
+    )
+
+  nms_S <- c(
+    "Mut_AbemaR_S",
+    "WT_AbemaR_S",
+    "Mut_PalboR_S",
+    "WT_PalboR_S",
+    "WT_PalboR_Clone_S",
+    "Mut_Vehicle_S",
+    "WT_Vehicle_S",
+    "Parental_S"
+  )
+  nms_G1 <- c(
+    "Mut_AbemaR_G1",
+    "WT_AbemaR_G1",
+    "Mut_PalboR_G1",
+    "WT_PalboR_G1",
+    "WT_PalboR_Clone_G1",
+    "Mut_Vehicle_G1",
+    "WT_Vehicle_G1",
+    "Parental_G1"
+  )
+  nms_G2M <- c(
+    "Mut_AbemaR_G2M",
+    "WT_AbemaR_G2M",
+    "Mut_PalboR_G2M",
+    "WT_PalboR_G2M",
+    "WT_PalboR_Clone_G2M",
+    "Mut_Vehicle_G2M",
+    "WT_Vehicle_G2M",
+    "Parental_G2M"
+  )
+  rbind(
+    tidyr::expand_grid(x = nms_S, y = nms_S) |> dplyr::filter(x != y),
+    tidyr::expand_grid(x = nms_G1, y = nms_G1) |> dplyr::filter(x != y),
+    tidyr::expand_grid(x = nms_G2M, y = nms_G2M) |> dplyr::filter(x != y)
+  ) |>
+    purrr::pwalk(\(x, y) {
+      rates_wide <<- rates_wide |> # global assignment
+        dplyr::mutate(
+          !!sym(sprintf("waldstat_%s_minus_%s", x, y)) := ((log(
+            !!sym(sprintf("lam_%s", x))
+          ) -
+            log(!!sym(sprintf("lam_%s", y)))) /
+            sqrt(
+              (pmax(1, !!sym(sprintf("phi_%s", x))) /
+                (!!sym(sprintf("lam_%s", x)) *
+                  !!sym(sprintf("N_reads_%s", x)))) +
+                (pmax(1, !!sym(sprintf("phi_%s", y))) /
+                  (!!sym(sprintf("lam_%s", y)) *
+                    !!sym(sprintf("N_reads_%s", y))))
+            ))
+        )
+    })
+
+  saveRDS(
+    rates_wide,
+    file.path(
+      ddir,
+      sprintf("waldstat-ranked-genes-across-sample_within-phase_%s.rds", prefix)
+    )
+  )
+  return(rates_wide)
+}
+```
+
+```{r}
+quasipoisson_glm_de_across_samples_within_phase_simpleaf()
+```
+
+### Calculate quasi-Poisson Wald statistics comparing clusters within a single sample.
+
+```{r}
+#' Calculate the Wald statistic in a quasiPoisson glm that compares two 
+#' clusters within a single sample at a time.
+#'
+#' Uses the sample-specific, per-gene estimated dispersions calculated above
+#' as part of the standard error of the tested coefficient in the QP glm.
+#'
+#' @param infile_rates Path to rds of estimated genewise rates per cluster 
+#' for a single sample.
+#' @param infile_dispersions Path to rds of estimated genewise dispersion per 
+#' sample.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of Wald statistics comparing clusters, cluster 
+#' specific expression rates for a single sample, and sample-specific 
+#' dispersion estimates.
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf <- function(
+  infile_rates,
+  infile_dispersions = "data/processed/02-scrnaseq/genewise-overdispersions_simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_rates))
+  rates <- readRDS(infile_rates)
+  k = as.numeric(gsub(
+    "^genewise-rates-within_kmeans([0-9]+)_.*",
+    "\\1",
+    prefix
+  ))
+
+  disps <- readRDS(infile_dispersions) |>
+    dplyr::filter(orig.ident == unique(rates$orig.ident))
+
+  rates_wide <- rates |>
+    tidyr::pivot_wider(
+      id_cols = gene,
+      names_from = cluster,
+      values_from = c("lam", "N_reads", "N_cells")
+    ) |>
+    dplyr::left_join(disps, by = "gene")
+
+  tidyr::expand_grid(x = 1:k, y = 1:k) |>
+    dplyr::filter(x != y) |>
+    purrr::pwalk(\(x, y) {
+      rates_wide <<- rates_wide |> # global assignment
+        dplyr::mutate(
+          !!sym(sprintf("waldstat_cluster%s_minus_cluster%s", x, y)) := ((log(
+            !!sym(sprintf("lam_%s", x))
+          ) -
+            log(!!sym(sprintf("lam_%s", y)))) /
+            sqrt(
+              (pmax(1, phi) /
+                (!!sym(sprintf("lam_%s", x)) *
+                  !!sym(sprintf("N_reads_%s", x)))) +
+                (pmax(1, phi) /
+                  (!!sym(sprintf("lam_%s", y)) *
+                    !!sym(sprintf("N_reads_%s", y))))
+            ))
+        )
+    })
+
+  saveRDS(
+    rates_wide,
+    file.path(
+      ddir,
+      sprintf(
+        "waldstat-ranked-genes-across-cluster_within-sample_%s.rds",
+        prefix
+      )
+    )
+  )
+  return(rates_wide)
+}
+```
+
+#### Parental
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT PalboR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut PalboR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3_simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT PalboR Clone
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT AbemaR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut AbemaR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT Vehicle
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut Vehicle
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+### Calculate quasi-Poisson Wald statistics comparing clusters within a single sample within a cell cycle phase.
+
+```{r}
+#' Calculate the Wald statistic in a quasiPoisson glm that compares two 
+#' clusters of cells within the same cell cycle phase within a single sample.
+#'
+#' Uses the sample-specific, per-gene estimated dispersions calculated above
+#'  as part of the standard error of the tested coefficient in the QP glm.
+#'
+#' @param infile_rates Path to rds of estimated genewise rates per cluster 
+#' within cell cycle phase for a single sample.
+#' @param infile_dispersions Path to rds of estimated genewise dispersion per 
+#' sample.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns Data frame of Wald statistics comparing clusters within each cell 
+#' cycle phase, (cluster x cell cycle phase) specific expression rates, and 
+#' sample specific dispersion estimates.
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf <- function(
+  infile_rates,
+  infile_dispersions = "data/processed/02-scrnaseq/genewise-overdispersions_simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_rates))
+  rates <- readRDS(infile_rates)
+  k = as.numeric(gsub("^genewise-rates-within_kmeans([0-9]+).*", "\\1", prefix))
+
+  disps <- readRDS(infile_dispersions) |>
+    dplyr::filter(orig.ident == unique(rates$orig.ident))
+
+  rates_wide <- rates |>
+    tidyr::pivot_wider(
+      id_cols = gene,
+      names_from = cluster_phase,
+      values_from = c("lam", "N_reads", "N_cells")
+    ) |>
+    dplyr::left_join(disps, by = "gene")
+
+  purrr::map(c("G1", "G2M", "S"), \(phase) {
+    tidyr::expand_grid(x = 1:k, y = 1:k) |>
+      dplyr::filter(x != y) |>
+      purrr::pwalk(\(x, y) {
+        if (
+          !(sprintf("lam_%s:%s", x, phase) %in% colnames(rates_wide)) |
+            !(sprintf("lam_%s:%s", y, phase) %in% colnames(rates_wide))
+        ) {
+          # Not enough cells,
+          print(sprintf(
+            "Not enough cells for either %s:%s or %s:%s.",
+            x,
+            phase,
+            y,
+            phase
+          ))
+          return()
+        } else {
+          rates_wide <<- rates_wide |> # global assignment
+            dplyr::mutate(
+              !!sym(sprintf(
+                "waldstat_cluster%s-%s_minus_cluster%s-%s",
+                x,
+                phase,
+                y,
+                phase
+              )) := ((log(!!sym(sprintf("lam_%s:%s", x, phase))) -
+                log(!!sym(sprintf("lam_%s:%s", y, phase)))) /
+                sqrt(
+                  (pmax(1, phi) /
+                    (!!sym(sprintf("lam_%s:%s", x, phase)) *
+                      !!sym(sprintf("N_reads_%s:%s", x, phase)))) +
+                    (pmax(1, phi) /
+                      (!!sym(sprintf("lam_%s:%s", y, phase)) *
+                        !!sym(sprintf("N_reads_%s:%s", y, phase))))
+                ))
+            )
+        }
+      })
+  })
+
+  (plt_hist <- rates_wide |>
+    dplyr::select(gene, starts_with("waldstat")) |>
+    tidyr::pivot_longer(
+      cols = !gene,
+      names_to = "comparison",
+      values_to = "waldstat"
+    ) |>
+    dplyr::mutate(
+      comparison_title = gsub(
+        "minus_",
+        "minus\n",
+        gsub("waldstat_", "", comparison)
+      )
+    ) |>
+    ggplot(aes(x = pmax(pmin(waldstat, 10), -10))) +
+    geom_histogram() +
+    labs(title = sprintf("%s Wald statistics", unique(rates_wide$orig.ident))) +
+    theme_bw() +
+    facet_wrap(~comparison_title))
+  ggplot2::ggsave(
+    file.path(
+      odir,
+      sprintf(
+        "waldstat-ranked-genes-across-cluster-within-sample-per-phase-histogram_%s.png",
+        prefix
+      )
+    ),
+    plt_hist,
+    width = 8,
+    height = 8
+  )
+
+  saveRDS(
+    rates_wide,
+    file.path(
+      ddir,
+      sprintf(
+        "waldstat-ranked-genes-across-cluster_within-sample-per-phase_%s.rds",
+        prefix
+      )
+    )
+  )
+  return(rates_wide)
+}
+```
+
+#### Parental
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT PalboR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut PalboR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT PalboR Clone
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT AbemaR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut AbemaR
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+#### WT Vehicle
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+#### Mut Vehicle
+
+```{r}
+quasipoisson_glm_de_across_clusters_within_sample_per_phase_simpleaf(
+  infile_rates = "data/processed/02-scrnaseq/genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+
+### Calculate cameraPR gene set testing across two samples within a cell cycle phase.
+
+```{r}
+#' Run limma::cameraPR gene set testing for Hallmark gene sets for contrasts 
+#' of interest within each cell cycle phase on gene lists ranked by 
+#' quasi-Poisson Wald statistics.
+#'
+#' @param infile_waldstats Data frame of Wald statistics comparing samples 
+#' within a cell cycle phase and (sample and cell cycle phase) specific 
+#' expression rates and sample specific dispersion estimates.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+run_cameraPR_across_sample_within_phase_1v1_contrasts_quasipoisson_glm_simpleaf <- function(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-sample_within-phase_genewise-rates-within-phase-per-sample_simpleaf-quant-dds-allsamples_filterqc_glmpca-umap-kmeans.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  set.seed(1039101)
+  prefix <- gsub(".rds", "", basename(infile_waldstats))
+
+  ws <- readRDS(infile_waldstats)
+  hk <- msigdbr::msigdbr(species = "human", category = "H") # Hallmark gene collection
+  phk = split(x = hk$human_gene_symbol, f = hk$gs_name)
+
+  (contrastdf <- rbind(
+    c("Mut_AbemaR", "Mut_Vehicle"),
+    c("WT_AbemaR", "WT_Vehicle"),
+    c("Mut_PalboR", "Mut_Vehicle"),
+    c("WT_PalboR", "WT_Vehicle"),
+
+    c("Mut_Vehicle", "WT_Vehicle"),
+    c("Mut_PalboR", "WT_PalboR"),
+    c("Mut_AbemaR", "WT_AbemaR")
+  ) |>
+    as_tibble())
+  names(contrastdf) <- c("x", "y")
+
+  rbind(
+    contrastdf |> dplyr::mutate(x = str_c(x, "_S"), y = str_c(y, "_S")),
+    contrastdf |> dplyr::mutate(x = str_c(x, "_G1"), y = str_c(y, "_G1")),
+    contrastdf |> dplyr::mutate(x = str_c(x, "_G2M"), y = str_c(y, "_G2M"))
+  ) |>
+    purrr::pmap(\(x, y) {
+      res <- ws |>
+        dplyr::filter(!is.na(!!sym(sprintf("waldstat_%s_minus_%s", x, y)))) |>
+        dplyr::arrange(dplyr::desc(
+          !!sym(sprintf("waldstat_%s_minus_%s", x, y))
+        ))
+      indexbp = limma::ids2indices(phk, res$gene) # order same as res
+      res_camerapr <- limma::cameraPR(
+        res |> dplyr::pull(!!sym(sprintf("waldstat_%s_minus_%s", x, y))),
+        indexbp
+      )
+
+      res_camerapr <- res_camerapr |>
+        as.data.frame() |>
+        tibble::rownames_to_column("gene_set") |>
+        tibble::column_to_rownames("gene_set")
+
+      saveRDS(
+        res_camerapr,
+        file.path(
+          ddir,
+          sprintf(
+            "cameraPR-by-quasipoisson-glm-waldstat-%s-minus-%s_%s.rds",
+            x,
+            y,
+            prefix
+          )
+        )
+      )
+      return(res_camerapr)
+    })
+}
+```
+
+```{r}
+#| output: false
+run_cameraPR_across_sample_within_phase_1v1_contrasts_quasipoisson_glm_simpleaf()
+```
+
+### Plot cameraPR gene set testing results across samples within cell cycle phase.
+
+```{r}
+#' Plot a bubble plot of the gene set testing results for the across sample
+#' (one vs. one) comparisons within each separate cell cycle phase.
+#'
+#' @param infiles Vector of filepaths of gene set testing output RDS files from
+#' [run_cameraPR_across_sample_within_phase_1v1_contrasts_quasipoisson_glm_simpleaf()].
+#' @param thresh FDR threshold per columns of plot.
+#' @param title Plot title.
+#' @param suffix Plot suffix to go in output filepath.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns ggplot2 object of plot.
+plot_cameraPR_heatmap_quasipoisson_glm_across_sample_within_phase_one_over_one_simpleaf <- function(
+  infiles,
+  thresh = 0.10,
+  title,
+  suffix,
+  width = 9,
+  height = 9,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dat <- infiles |>
+    purrr::map_dfr(\(x) {
+      readRDS(x) |>
+        dplyr::mutate(
+          sid = gsub(
+            "data/processed/02-scrnaseq/cameraPR-by-quasipoisson-glm-waldstat-(.*)_waldstat.*rds",
+            "\\1",
+            x
+          )
+        ) |> # extract sample names
+        tibble::rownames_to_column("gene_set") |>
+        dplyr::mutate(gs_name = gsub("HALLMARK_", "", gene_set)) |>
+        dplyr::mutate(Phase = gsub(".*_([^_]*)", "\\1", sid))
+    }) |>
+    dplyr::relocate(sid) |>
+    dplyr::mutate(sid = gsub("-minus-", "_over_", sid)) |> # trims the between-cluster _ over rest names
+    dplyr::mutate(
+      sid = forcats::fct_relevel(
+        sid,
+
+        "Mut_AbemaR_S_over_Mut_PalboR_S",
+        "Mut_AbemaR_S_over_Mut_Vehicle_S",
+        "Mut_AbemaR_S_over_WT_AbemaR_S",
+        "WT_AbemaR_S_over_WT_PalboR_S",
+        "WT_AbemaR_S_over_WT_Vehicle_S",
+        "Mut_PalboR_S_over_Mut_Vehicle_S",
+        "Mut_PalboR_S_over_WT_PalboR_S",
+        "WT_PalboR_Clone_S_over_WT_PalboR_S",
+        "WT_PalboR_S_over_WT_Vehicle_S",
+        "Mut_Vehicle_S_over_WT_Vehicle_S",
+        "WT_Vehicle_S_over_Parental_S",
+
+        "Mut_AbemaR_S_over_Parental_S",
+        "WT_AbemaR_S_over_Parental_S",
+        "Mut_PalboR_S_over_Parental_S",
+        "WT_PalboR_S_over_Parental_S",
+
+        "Mut_AbemaR_G1_over_Mut_PalboR_G1",
+        "Mut_AbemaR_G1_over_Mut_Vehicle_G1",
+        "Mut_AbemaR_G1_over_WT_AbemaR_G1",
+        "WT_AbemaR_G1_over_WT_PalboR_G1",
+        "WT_AbemaR_G1_over_WT_Vehicle_G1",
+        "Mut_PalboR_G1_over_Mut_Vehicle_G1",
+        "Mut_PalboR_G1_over_WT_PalboR_G1",
+        "WT_PalboR_Clone_G1_over_WT_PalboR_G1",
+        "WT_PalboR_G1_over_WT_Vehicle_G1",
+        "Mut_Vehicle_G1_over_WT_Vehicle_G1",
+        "WT_Vehicle_G1_over_Parental_G1",
+
+        "Mut_AbemaR_G1_over_Parental_G1",
+        "WT_AbemaR_G1_over_Parental_G1",
+        "Mut_PalboR_G1_over_Parental_G1",
+        "WT_PalboR_G1_over_Parental_G1",
+
+        "Mut_AbemaR_G2M_over_Mut_PalboR_G2M",
+        "Mut_AbemaR_G2M_over_Mut_Vehicle_G2M",
+        "Mut_AbemaR_G2M_over_WT_AbemaR_G2M",
+        "WT_AbemaR_G2M_over_WT_PalboR_G2M",
+        "WT_AbemaR_G2M_over_WT_Vehicle_G2M",
+        "Mut_PalboR_G2M_over_Mut_Vehicle_G2M",
+        "Mut_PalboR_G2M_over_WT_PalboR_G2M",
+        "WT_PalboR_Clone_G2M_over_WT_PalboR_G2M",
+        "WT_PalboR_G2M_over_WT_Vehicle_G2M",
+        "Mut_Vehicle_G2M_over_WT_Vehicle_G2M",
+        "WT_Vehicle_G2M_over_Parental_G2M",
+
+        "Mut_AbemaR_G2M_over_Parental_G2M",
+        "WT_AbemaR_G2M_over_Parental_G2M",
+        "Mut_PalboR_G2M_over_Parental_G2M",
+        "WT_PalboR_G2M_over_Parental_G2M"
+      )
+    ) |>
+    dplyr::filter(FDR < thresh) |>
+    dplyr::mutate(Direction = factor(Direction, levels = c("Up", "Down")))
+  if (nrow(dat) == 0) {
+    print("No gene sets passing FDR threshold.")
+  }
+
+  gs_rnk <- dat |>
+    dplyr::ungroup() |>
+    dplyr::group_by(gs_name) |>
+    dplyr::mutate(rnk = sum(Direction == "Up") - sum(Direction == "Down")) |>
+    dplyr::arrange(rnk, gs_name) |>
+    dplyr::distinct(gs_name) |>
+    dplyr::pull()
+
+  (plt <- dat |>
+    dplyr::mutate(Phase = factor(Phase, levels = c("S", "G1", "G2M"))) |>
+    dplyr::mutate(gs_name = forcats::fct_relevel(factor(gs_name), gs_rnk)) |>
+    ggplot2::ggplot(aes(
+      x = sid,
+      y = gs_name,
+      color = Direction,
+      label = NGenes,
+      size = FDR
+    )) +
+    ggplot2::geom_point() +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1)
+    ) +
+    ggplot2::scale_color_manual(values = c(col_high, col_low), drop = FALSE) +
+    ggplot2::scale_size(trans = "reverse", range = c(.1, 3)) +
+    ggplot2::guides(
+      colour = ggplot2::guide_legend(order = 1),
+      size = ggplot2::guide_legend(order = 2)
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = NULL,
+      title = title,
+      subtitle = sprintf("%s, %s%% FDR per column", "condition", thresh * 100)
+    ) +
+    ggplot2::facet_wrap(~Phase, nrow = 1, scales = "free_x"))
+
+  ggsave(
+    file.path(
+      odir,
+      sprintf("cameraPR-by-QPglm-heatmap_%.2f_%s.pdf", thresh, suffix)
+    ),
+    plt,
+    width = width,
+    height = height
+  )
+  ggsave(
+    file.path(
+      odir,
+      sprintf("cameraPR-by-QPglm-heatmap_%.2f_%s.png", thresh, suffix)
+    ),
+    plt,
+    width = width,
+    height = height
+  )
+
+  return(plt)
+}
+```
+
+#### Treatment over Vehicle (Figure 6D).
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_heatmap_quasipoisson_glm_across_sample_within_phase_one_over_one_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR-by-quasipoisson.*(AbemaR|PalboR).*minus.*Vehicle.*phase",
+    full.names = TRUE
+  ),
+  title = "AbemaR PalboR over Vehicle, by phase",
+  width = 6,
+  suffix = "QPglm-minmaxzero-delta-waldstat-across-sample-within-phase-AbemaR-PalboR-over-Vehicle"
+)
+```
+
+#### Mutant over WT (Supplementary Figure S7C).
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_heatmap_quasipoisson_glm_across_sample_within_phase_one_over_one_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR-by-quasipoisson.*Mut_(AbemaR|PalboR|Vehicle).*minus.*WT.*phase",
+    full.names = TRUE
+  ),
+  title = "Mut over WT (AbemaR, PalboR, Vehicle), by phase",
+  width = 6,
+  suffix = "QPglm-minmaxzero-delta-waldstat-across-sample-within-phase-Mut-over-WT-AbemaR-PalboR-Vehicle"
+)
+```
+
+### Calculate cameraPR gene set testing across all clusters (1 vs. rest) per sample.
+
+```{r}
+#' Run limma::cameraPR gene set testing for Hallmark gene sets for contrasts of
+#' (one vs. rest) on gene lists ranked using quasipoisson Wald statistic between kmeans
+#' clusters within a sample using the following criteria:
+#'
+#' for a set of (one vs. rest) comparisons, if the QPglm Wald statistics:
+#' are all positive, use the minimum delta as a marker ranking,
+#' are all negative, use the maximum delta as a marker ranking,
+#' are mixed positive and negative, use zero as a marker ranking (noninformative), and
+#' is NA (phi, rates were zero), we set this to zero, as this indicates no 
+#' difference between the clusters (zero is called genewide in this case)
+#'
+#' @param infile_rds Data frame of Wald statistics comparing clusters, cluster 
+#' specific expression rates for a single sample, and sample-specific 
+#' dispersion estimates.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns List of cameraPR outputs for each tested cluster.
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf <- function(
+  infile_waldstats,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_waldstats))
+  k = as.numeric(gsub(
+    "^waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans([0-9]+).*",
+    "\\1",
+    prefix
+  ))
+  prefix <- gsub(
+    "waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_",
+    "",
+    prefix
+  ) # shorten the filename
+
+  ws <- readRDS(infile_waldstats)
+  hk <- msigdbr::msigdbr(species = "human", category = "H") # Hallmark gene collection
+  phk = split(x = hk$human_gene_symbol, f = hk$gs_name)
+
+  res_list <- 1:k |>
+    purrr::map(\(i) {
+      res <- ws |>
+        dplyr::mutate(
+          !!sym(sprintf(
+            "minmaxzero_delta_waldstat_cluster%s_minus_other",
+            i
+          )) := dplyr::case_when(
+            MatrixGenerics::rowMins(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+              "waldstat_cluster%s_minus",
+              i
+            ))))) >
+              0 ~ MatrixGenerics::rowMins(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+              "waldstat_cluster%s_minus",
+              i
+            ))))),
+            MatrixGenerics::rowMaxs(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+              "waldstat_cluster%s_minus",
+              i
+            ))))) <
+              0 ~ MatrixGenerics::rowMaxs(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+              "waldstat_cluster%s_minus",
+              i
+            ))))),
+            .default = 0
+          )
+        ) |>
+        dplyr::filter(
+          !is.na(
+            !!sym(sprintf("minmaxzero_delta_waldstat_cluster%i_minus_other", i))
+          )
+        ) |>
+        dplyr::arrange(dplyr::desc(
+          !!sym(sprintf("minmaxzero_delta_waldstat_cluster%i_minus_other", i))
+        ))
+
+      # Check that we calculated this delta correctly
+      stopifnot(all(
+        res |>
+          dplyr::select(
+            dplyr::starts_with(sprintf("waldstat_cluster%s_minus", i)),
+            !!sym(sprintf("minmaxzero_delta_waldstat_cluster%s_minus_other", i))
+          ) |>
+          dplyr::filter(
+            !!sym(sprintf(
+              "minmaxzero_delta_waldstat_cluster%s_minus_other",
+              i
+            )) <
+              0
+          ) <
+          0
+      ))
+      stopifnot(all(
+        res |>
+          dplyr::select(
+            dplyr::starts_with(sprintf("waldstat_cluster%s_minus", i)),
+            !!sym(sprintf("minmaxzero_delta_waldstat_cluster%s_minus_other", i))
+          ) |>
+          dplyr::filter(
+            !!sym(sprintf(
+              "minmaxzero_delta_waldstat_cluster%s_minus_other",
+              i
+            )) >
+              0
+          ) >
+          0
+      ))
+
+      indexbp = limma::ids2indices(phk, res$gene) # order same as res
+      res_camerapr <- limma::cameraPR(
+        res |>
+          dplyr::pull(
+            !!sym(sprintf("minmaxzero_delta_waldstat_cluster%s_minus_other", i))
+          ),
+        indexbp
+      )
+      res_camerapr$N_cells <- res |>
+        dplyr::pull(!!sym(sprintf("N_cells_%i", i))) |>
+        unique() # For nice labels when plotting in heatmap
+
+      res_camerapr <- res_camerapr |>
+        as.data.frame() |>
+        tibble::rownames_to_column("gene_set")
+
+      saveRDS(
+        res_camerapr,
+        file.path(
+          ddir,
+          sprintf(
+            "cameraPR-by-QPglm-minmaxzero-delta-waldstat-cluster%i-minus-other_%s.rds",
+            i,
+            prefix
+          )
+        )
+      )
+      saveRDS(
+        res,
+        file.path(
+          ddir,
+          sprintf(
+            "QPglm-minmaxzero-delta-waldstat-cluster%i-minus-other_%s.rds",
+            i,
+            prefix
+          )
+        )
+      )
+      return(res_camerapr)
+    })
+  return(res_list)
+}
+```
+
+### Plot cameraPR gene set testing across clusters per sample.
+
+```{r}
+#' Plot a bubble plot of the gene set testing results for the across clusters
+#' within a sample (one vs. rest) comparisons.
+#'
+#' @param infiles Vector of filepaths of gene set testing output RDS files from
+#' [run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf()].
+#' @param thresh FDR threshold per columns of plot.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns ggplot2 object of plot.
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf <- function(
+  infiles,
+  thresh = 0.10,
+  width = 6,
+  height = 8,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dat <- infiles |>
+    purrr::map_dfr(\(x) {
+      readRDS(x) |>
+        dplyr::mutate(
+          sid = gsub(
+            "data/processed/02-scrnaseq/cameraPR-by-QPglm-minmaxzero-delta-waldstat-(.*)-minus.*rds",
+            "\\1",
+            x
+          )
+        ) |> # extract sample names
+        dplyr::mutate(gs_name = gsub("HALLMARK_", "", gene_set))
+    }) |>
+    dplyr::relocate(sid) |>
+    dplyr::mutate(sid = gsub("-minus-", "_over_", sid)) |> # trims the between-cluster _ over rest names
+    dplyr::filter(FDR < thresh) |>
+    dplyr::mutate(Direction = factor(Direction, levels = c("Up", "Down")))
+  if (nrow(dat) == 0) {
+    print("No gene sets passing FDR threshold.")
+  }
+
+  gs_rnk <- dat |>
+    dplyr::ungroup() |>
+    dplyr::group_by(gs_name) |>
+    dplyr::mutate(rnk = sum(Direction == "Up") - sum(Direction == "Down")) |>
+    dplyr::arrange(rnk, gs_name) |>
+    dplyr::distinct(gs_name) |>
+    dplyr::pull()
+
+  clustername <- gsub(
+    ".*other_(.*)_simpleaf-quant-dds-allsamples_filterqc_.*",
+    "\\1",
+    basename(infiles[[1]])
+  )
+  samplename <- gsub(
+    ".*other_(.*)_simpleaf-quant-dds-allsamples_filterqc_(.*)_glmpca-umap-kmeans.rds",
+    "\\2",
+    basename(infiles[[1]])
+  )
+  title = sprintf(
+    "%s\n%s\ncluster-over-rest gene set testing",
+    samplename,
+    clustername
+  )
+
+  (plt <- dat |>
+    dplyr::mutate(
+      sid_name = sprintf("Cluster %s (N=%i)", gsub("cluster", "", sid), N_cells)
+    ) |>
+    ggplot2::ggplot(aes(
+      x = sid_name,
+      y = gs_name,
+      color = Direction,
+      label = NGenes,
+      size = FDR
+    )) +
+    ggplot2::geom_point() +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1)
+    ) +
+    ggplot2::scale_y_discrete(limits = rev) +
+    ggplot2::scale_color_manual(values = c(col_high, col_low), drop = FALSE) +
+    ggplot2::scale_size(trans = "reverse", range = c(.1, 3)) +
+    ggplot2::guides(
+      colour = ggplot2::guide_legend(order = 1),
+      size = ggplot2::guide_legend(order = 2)
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = NULL,
+      title = title,
+      subtitle = sprintf("%s, %s%% FDR per column", "condition", thresh * 100)
+    ))
+
+  ggsave(
+    file.path(
+      odir,
+      sprintf(
+        "cameraPR-by-QPglm-heatmap_%.2f_%s_%s.pdf",
+        thresh,
+        samplename,
+        clustername
+      )
+    ),
+    plt,
+    width = width,
+    height = height
+  )
+  ggsave(
+    file.path(
+      odir,
+      sprintf(
+        "cameraPR-by-QPglm-heatmap_%.2f_%s_%s.png",
+        thresh,
+        samplename,
+        clustername
+      )
+    ),
+    plt,
+    width = width,
+    height = height
+  )
+
+  return(plt)
+}
+```
+
+#### Parental (Figure 6E).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2_simpleaf.*Parental_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+
+#### WT PalboR (Figure 6F).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans3_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3_simpleaf.*WT_PalboR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### Mut PalboR (Figure 6G).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans3_simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3_simpleaf.*Mut_PalboR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT PalboR Clone (Figure 6H).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans3_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3_simpleaf.*WT_PalboR_Clone_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT AbemaR (Figure 6I).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2_simpleaf.*WT_AbemaR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### Mut AbemaR (Figure 6J).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2_simpleaf.*Mut_AbemaR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT Vehicle (Supplementary Figure S7D).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2_simpleaf.*WT_Vehicle_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### Mut Vehicle (Supplementary Figure S7E).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample_genewise-rates-within_kmeans2_simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2_simpleaf.*Mut_Vehicle_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+### Calculate cameraPR gene set testing across clusters within cell cycle phase per sample
+
+```{r}
+#' Run limma::cameraPR gene set testing for Hallmark gene sets for contrasts of
+#' interest on gene lists ranked by quasipoisson Wald statistic between kmeans
+#' clusters within a sample within separate called cell cycle phases using the
+#' following criteria:
+#'
+#' for a certain set of comparisons, if the QPglm Wald statistics:
+#' are all positive, uses the minimum delta as a marker ranking,
+#' are all negative, uses the maximum delta as a marker ranking,
+#' are mixed positive and negative, use zero as a marker ranking (noninformative),
+#' is NA (phi, rates were zero), we set this to zero, as this indicates no 
+#' difference between the clusters (zero is called genewide in this case)
+#'
+#' @param infile_rds Path of rds with dataframe of Seurat::FoldChanges.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns List of cameraPR outputs for each tested cluster.
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf <- function(
+  infile_waldstats,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_waldstats))
+  k = as.numeric(gsub(
+    "^waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans([0-9]+).*",
+    "\\1",
+    prefix
+  ))
+  prefix <- gsub(
+    "waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_",
+    "",
+    prefix
+  ) # just to shorten the filename
+
+  ws <- readRDS(infile_waldstats)
+  hk <- msigdbr::msigdbr(species = "human", category = "H") # Hallmark gene collection
+  phk = split(x = hk$human_gene_symbol, f = hk$gs_name)
+
+  res_list <- purrr::map(c("G1", "G2M", "S"), \(phase) {
+    res_list <- 1:k |>
+      purrr::map(\(i) {
+        if (
+          !any(grepl(
+            sprintf("waldstat_cluster%s-%s_minus", i, phase),
+            colnames(ws)
+          ))
+        ) {
+          # Not enough cells to do that test
+          print(sprintf(
+            "Not able to test waldstat_cluster%s-%s_minus",
+            i,
+            phase
+          ))
+          return()
+        } else {
+          res <- ws |>
+            dplyr::mutate(
+              !!sym(sprintf(
+                "minmaxzero_delta_waldstat_cluster%s-%s_minus_other",
+                i,
+                phase
+              )) := dplyr::case_when(
+                MatrixGenerics::rowMins(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+                  "waldstat_cluster%s-%s_minus",
+                  i,
+                  phase
+                ))))) >
+                  0 ~ MatrixGenerics::rowMins(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+                  "waldstat_cluster%s-%s_minus",
+                  i,
+                  phase
+                ))))),
+                MatrixGenerics::rowMaxs(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+                  "waldstat_cluster%s-%s_minus",
+                  i,
+                  phase
+                ))))) <
+                  0 ~ MatrixGenerics::rowMaxs(as.matrix(dplyr::pick(dplyr::starts_with(sprintf(
+                  "waldstat_cluster%s-%s_minus",
+                  i,
+                  phase
+                ))))),
+                .default = 0
+              )
+            ) |>
+            dplyr::filter(
+              !is.na(
+                !!sym(sprintf(
+                  "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                  i,
+                  phase
+                ))
+              )
+            ) |>
+            dplyr::arrange(dplyr::desc(
+              !!sym(sprintf(
+                "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                i,
+                phase
+              ))
+            ))
+
+          # Check that we calculated this delta correctly
+          stopifnot(all(
+            res |>
+              dplyr::select(
+                dplyr::starts_with(sprintf(
+                  "waldstat_cluster%s-%s_minus",
+                  i,
+                  phase
+                )),
+                !!sym(sprintf(
+                  "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                  i,
+                  phase
+                ))
+              ) |>
+              dplyr::filter(
+                !!sym(sprintf(
+                  "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                  i,
+                  phase
+                )) <
+                  0
+              ) <
+              0
+          ))
+          stopifnot(all(
+            res |>
+              dplyr::select(
+                dplyr::starts_with(sprintf(
+                  "waldstat_cluster%s-%s_minus",
+                  i,
+                  phase
+                )),
+                !!sym(sprintf(
+                  "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                  i,
+                  phase
+                ))
+              ) |>
+              dplyr::filter(
+                !!sym(sprintf(
+                  "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                  i,
+                  phase
+                )) >
+                  0
+              ) >
+              0
+          ))
+
+          indexbp = limma::ids2indices(phk, res$gene) # order same as res
+          res_camerapr <- limma::cameraPR(
+            res |>
+              dplyr::pull(
+                !!sym(sprintf(
+                  "minmaxzero_delta_waldstat_cluster%i-%s_minus_other",
+                  i,
+                  phase
+                ))
+              ),
+            indexbp
+          )
+          res_camerapr$N_cells <- res |>
+            dplyr::pull(!!sym(sprintf("N_cells_%i:%s", i, phase))) |>
+            unique() # For nice labels when plotting in heatmap
+
+          res_camerapr <- res_camerapr |>
+            as.data.frame() |>
+            tibble::rownames_to_column("gene_set")
+
+          saveRDS(
+            res_camerapr,
+            file.path(
+              ddir,
+              sprintf(
+                "cameraPR-by-QPglm-minmaxzero-delta-waldstat-cluster%i-%s-minus-other_%s.rds",
+                i,
+                phase,
+                prefix
+              )
+            )
+          )
+          saveRDS(
+            res,
+            file.path(
+              ddir,
+              sprintf(
+                "QPglm-minmaxzero-delta-waldstat-cluster%i-%s-minus-other_%s.rds",
+                i,
+                phase,
+                prefix
+              )
+            )
+          )
+          return(res_camerapr)
+        }
+      })
+  })
+
+  return(res_list)
+}
+```
+
+### Plot cameraPR gene set testing across clusters within cell cycle phase per sample
+
+```{r}
+#' Plot a bubble plot of the gene set testing results for the across clusters
+#' (one vs. rest) within a cell cycle phase within sample comparisons.
+#'
+#' @param infiles Vector of filepaths of gene set testing output RDS files from
+#' [run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf()].
+#' @param thresh FDR threshold per columns of plot.
+#' @param title Plot title.
+#' @param suffix Plot suffix to go in output filepath.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+#'
+#' @returns ggplot2 object of bubble plot.
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf <- function(
+  infiles,
+  thresh = 0.10,
+  facet_by = NULL,
+  width = 6,
+  height = 8,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  dat <- infiles |>
+    purrr::map_dfr(\(x) {
+      readRDS(x) |>
+        dplyr::mutate(
+          sid = gsub(
+            "data/processed/02-scrnaseq/cameraPR-by-QPglm-minmaxzero-delta-waldstat-(.*)-minus.*rds",
+            "\\1",
+            x
+          )
+        ) |> # extract sample names
+        dplyr::mutate(gs_name = gsub("HALLMARK_", "", gene_set)) |>
+        tidyr::separate_wider_delim(
+          sid,
+          delim = "-",
+          names = c("Cluster", "Phase"),
+          cols_remove = FALSE
+        )
+    }) |>
+    dplyr::relocate(sid) |>
+    dplyr::mutate(sid = gsub("-minus-", "_over_", sid)) |> # trims the between-cluster _ over rest names
+    dplyr::filter(FDR < thresh) |>
+    dplyr::mutate(Direction = factor(Direction, levels = c("Up", "Down")))
+  if (nrow(dat) == 0) {
+    print("No gene sets passing FDR threshold.")
+  }
+
+  gs_rnk <- dat |>
+    dplyr::ungroup() |>
+    dplyr::group_by(gs_name) |>
+    dplyr::mutate(rnk = sum(Direction == "Up") - sum(Direction == "Down")) |>
+    dplyr::arrange(rnk, gs_name) |>
+    dplyr::distinct(gs_name) |>
+    dplyr::pull()
+
+  clustername <- gsub(
+    ".*other_(.*)_simpleaf-quant-dds-allsamples_filterqc_.*",
+    "\\1",
+    basename(infiles[[1]])
+  )
+  samplename <- gsub(
+    ".*other_(.*)_simpleaf-quant-dds-allsamples_filterqc_(.*)_glmpca-umap-kmeans.rds",
+    "\\2",
+    basename(infiles[[1]])
+  )
+  title = sprintf(
+    "%s\n%s\ncluster-over-rest gene set testing",
+    samplename,
+    clustername
+  )
+
+  (plt <- dat |>
+    dplyr::mutate(Phase = factor(Phase, levels = c("S", "G1", "G2M"))) |>
+    dplyr::mutate(
+      sid_name = sprintf("Cluster %s (N=%i)", gsub("cluster", "", sid), N_cells)
+    ) |>
+    ggplot2::ggplot(aes(
+      x = sid_name,
+      y = gs_name,
+      color = Direction,
+      label = NGenes,
+      size = FDR
+    )) +
+    ggplot2::geom_point() +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1)
+    ) +
+    ggplot2::scale_y_discrete(limits = rev) +
+    ggplot2::scale_color_manual(values = c(col_high, col_low), drop = FALSE) +
+    ggplot2::scale_size(trans = "reverse", range = c(.1, 3)) +
+    ggplot2::guides(
+      colour = ggplot2::guide_legend(order = 1),
+      size = ggplot2::guide_legend(order = 2)
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = NULL,
+      title = title,
+      subtitle = sprintf("%s, %s%% FDR per column", "condition", thresh * 100)
+    ) +
+    ggplot2::facet_wrap(~Phase, nrow = 1, scales = "free_x"))
+
+  ggsave(
+    file.path(
+      odir,
+      sprintf(
+        "cameraPR-by-QPglm-heatmap_%.2f_%s_%s.pdf",
+        thresh,
+        samplename,
+        clustername
+      )
+    ),
+    plt,
+    width = width,
+    height = height
+  )
+  ggsave(
+    file.path(
+      odir,
+      sprintf(
+        "cameraPR-by-QPglm-heatmap_%.2f_%s_%s.png",
+        thresh,
+        samplename,
+        clustername
+      )
+    ),
+    plt,
+    width = width,
+    height = height
+  )
+
+  return(plt)
+}
+```
+
+#### Parental (Supplementary Figure S8A).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Parental_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3.*within-phase.*Parental_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT Vehicle (Supplementary Figure S8B).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2.*within-phase.*WT_Vehicle_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### Mut Vehicle (Supplementary Figure S8C).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Mut_Vehicle_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2.*within-phase.*Mut_Vehicle_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT PalboR (Supplementary Figure S8D).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3.*within-phase.*WT_PalboR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### Mut PalboR (Supplementary Figure S8E).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Mut_PalboR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3.*within-phase.*Mut_PalboR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT PalboR Clone (Supplementary Figure S8F).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans3-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_PalboR_Clone_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans3.*within-phase.*WT_PalboR_Clone_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### WT AbemaR (Supplementary Figure S8G).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_WT_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2.*within-phase.*WT_AbemaR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+#### Mut AbemaR (Supplementary Figure S8H).
+
+```{r}
+#| output: false
+run_cameraPR_with_delta_1vrest_contrasts_across_clusters_within_sample_within_phase_quasipoisson_glm_simpleaf(
+  infile_waldstats = "data/processed/02-scrnaseq/waldstat-ranked-genes-across-cluster_within-sample-per-phase_genewise-rates-within_kmeans2-within-phase_geq50cells_simpleaf-quant-dds-allsamples_filterqc_Mut_AbemaR_glmpca-umap-kmeans.rds"
+)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+plot_cameraPR_with_delta_heatmap_quasipoisson_glm_across_clusters_within_sample_within_phase_simpleaf(
+  infiles = list.files(
+    "data/processed/02-scrnaseq",
+    pattern = "cameraPR.*other_kmeans2.*within-phase.*Mut_AbemaR_glmpca-umap-kmeans\\.rds",
+    full.names = TRUE
+  )
+)
+```
+
+## Inferred copy number analysis
+
+Note, due to large memory requirements, we recommend running this step on a high-performance computing environment and include sample SLURM submission code and R code and show pre-computed output plots below.
+
+### Create gene order table from GTF used for alignment
+
+```{r}
+#' Convert a gtf to a format compatible with Broad's infercnv.
+#'
+#' Takes the min and max coordinates of each gene in the gtf that was used to
+#' run nf-core scrnaseq simpleaf.
+#'
+#' Removes genes that occur in GTF across multiple chromosomes.
+#'
+#' @param infile_gtf Path to GTF file used to align scRNAseq samples.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+make_gene_order_file_simpleaf <- function(
+  infile_gtf = "/rafalab/drusso/genomes/refgenie_0.12.1_refgenconf_0.12.2_hg38_tmp/gencode_gtf/hg38.gtf.gz",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  d <- data.table::fread(
+    infile_gtf,
+    skip = 5,
+    col.names = c(
+      "seqname",
+      "source",
+      "feature",
+      "start",
+      "end ",
+      "score",
+      "strand",
+      "frame",
+      "attribute"
+    )
+  )
+  out <- d |>
+    dplyr::mutate(
+      gid = gsub("\"", "", gsub(".*gene_name\ ([^;]*).*", "\\1", attribute))
+    ) |> # get gene name
+    dplyr::rename(end = `end `) |>
+    dplyr::select(gid, seqname, start, end) |>
+    dplyr::group_by(gid, seqname) |>
+    dplyr::mutate(start = min(start), end = max(end)) |> # span entire gene start to end
+    dplyr::ungroup() |>
+    dplyr::select(gid, seqname, start, end) |>
+    dplyr::distinct()
+
+  # A few genes appear on multiple chromosomes -- filter these out
+  multi_genes <- out |>
+    dplyr::count(gid) |>
+    dplyr::filter(n > 1) |>
+    dplyr::pull(gid)
+  out <- out |>
+    dplyr::filter(!(gid %in% multi_genes))
+
+  readr::write_tsv(out, file.path(ddir, sprintf("hg38_genes_simpleaf.txt")))
+  return(out)
+}
+```
+
+```{r}
+make_gene_order_file_simpleaf()
+```
+
+### Run inverCNV
+
+#### Sample R script to run invercnf: R/10-sc-inferCNV.R
+```{r}
+#| eval: false
+
+library(tidyverse)
+library(Seurat)
+library(infercnv)
+
+#' Run Broad's infercnv on scRNAseq samples using the Parental sample as the
+#' reference.
+#'
+#' May need to set options(bitmapType='cairo') to get plots to render,
+#' plotting moved to plot_infercnv_simpleaf() function below.
+#'
+#' @param infile_seurat_rds Path to rds of Seurat object of all samples.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+run_infercnv_simpleaf <- function(
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc.rds",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  dds <- readRDS(infile_seurat_rds)
+  counts <- LayerData(dds, assay = "RNA", layer = "counts")
+
+  meta <- dds@meta.data
+
+  # Gene order txt file created above.
+  d <- readr::read_tsv("data/processed/02-scrnaseq/hg38_genes_simpleaf.txt")
+  gcts <- d$seqname |> table() |> sort()
+  names(gcts[gcts < 10]) # scaffold transcripts
+
+  d <- d |>
+    filter(!(seqname %in% c(names(gcts[gcts < 10])))) |>
+    mutate(
+      seqname = factor(seqname, levels = str_c("chr", c(1:23, "X", "Y", "M")))
+    ) |>
+    arrange(seqname, start)
+
+  infercnv_obj = CreateInfercnvObject(
+    raw_counts_matrix = counts,
+    annotations_file = (meta |> select(orig.ident)),
+    delim = "\t",
+    ref_group_names = c("Parental"),
+    gene_order_file = (d |> tibble::column_to_rownames("gid")),
+    chr_exclude = c(names(gcts[gcts < 10]))
+  )
+
+  out_dir = tempfile()
+  infercnv_obj_default = infercnv::run(
+    infercnv_obj,
+    cutoff = 0.1,
+    out_dir = ddir,
+    cluster_by_groups = TRUE,
+    plot_steps = FALSE,
+    denoise = TRUE,
+    HMM = FALSE,
+    no_plot = TRUE, # can be set to FALSE to generate plot in this step
+    no_prelim_plot = TRUE,
+    png_res = 60
+  )
+}
+
+#' Plot inferCNV heatmap.
+#'
+#' @param infile_infercnv Path to final output file from infercnv.
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_infercnv_simpleaf <- function(
+  infile_infercnv = "data/processed/02-scrnaseq/run.final.infercnv_obj",
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  d <- readRDS(infile_infercnv)
+  infercnv::plot_cnv(
+    d,
+    out_dir = odir,
+    obs_title = "Observations (Cells)",
+    ref_title = "References (Cells)",
+    cluster_by_groups = TRUE,
+    x.center = 1,
+    x.range = "auto",
+    hclust_method = 'ward.D',
+    color_safe_pal = FALSE,
+    output_filename = "infercnv-simpleaf",
+    output_format = "pdf",
+    png_res = 300,
+    dynamic_resize = 0
+  )
+}
+
+#' Plot a ridgeplot of inferred copynumber for each gene in a given vector on
+#' the inferCNV run on the simpleaf processed scRNAseq samples.
+#'
+#' @param infile_infercnv Path to rds of infercnv final object results.
+#' @param infile_seurat_rds Path to rds of Seurat object used to run infercnv.
+#' @param glist Vector of genes to plot.
+#' @param width Plot width (in).
+#' @param height Plot height (in).
+#' @param ddir Processed data directory.
+#' @param odir Processed output directory.
+plot_ridgeplot_gene_infercnv_simpleaf <- function(
+  infile_infercnv = "data/processed/02-scrnaseq/run.final.infercnv_obj",
+  infile_seurat_rds = "data/processed/02-scrnaseq/simpleaf-quant-dds-allsamples_filterqc.rds",
+  glist = c("RB1"),
+  width = 6,
+  height = 5,
+  ddir = "data/processed/02-scrnaseq",
+  odir = "data/processed/02-scrnaseq"
+) {
+  d <- readRDS(infile_infercnv)
+
+  cnv_data <- d@expr.data |>
+    t() |>
+    as.data.frame() |>
+    tibble::rownames_to_column("bid") |>
+    as_tibble()
+
+  prefix <- gsub(".rds", "", basename(infile_seurat_rds))
+  dds <- readRDS(infile_seurat_rds)
+  meta <- dds@meta.data |>
+    tibble::rownames_to_column("bid")
+
+  for (gid in glist) {
+    plt <- cnv_data |>
+      select(bid, !!sym(gid)) |>
+      inner_join(meta, by = "bid") |>
+      ggplot(aes(y = orig.ident, x = !!sym(gid), fill = orig.ident)) +
+      ggridges::geom_density_ridges(scale = .9, alpha = 1) +
+      labs(title = gid, y = NULL, x = "Inferred copy number") +
+      theme_bw() +
+      scale_y_discrete(limits = rev) +
+      scale_fill_manual(name = "Condition", values = pal_orig.ident)
+    ggsave(
+      file.path(odir, sprintf("infercnv-simpleaf-%s_%s.pdf", gid, prefix)),
+      plt,
+      width = width,
+      height = height
+    )
+    ggsave(
+      file.path(odir, sprintf("infercnv-simpleaf-%s_%s.png", gid, prefix)),
+      plt,
+      width = width,
+      height = height
+    )
+    print(plt)
+  }
+}
+
+run_infercnv_simpleaf()
+plot_infercnv_simpleaf()
+plot_ridgeplot_gene_infercnv_simpleaf()
+```
+
+#### Sample SLURM submission script to run inferCNV.
+
+Note, JAGS needs to be installed to run the inferCNV R package.
+
+```{bash}
+#| eval: false
+
+#!/bin/bash
+#SBATCH --job-name=10-sc-inferCNV
+#SBATCH --time=12:00:00
+#SBATCH --mem=124G
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=logs/10-sc-inferCNV_%A.err
+#SBATCH --output=logs/10-sc-inferCNV_%A.out
+#SBATCH --open-mode=append
+
+module load jags/4.3.1
+module load R/4.3.2
+
+Rscript R/10-sc-inferCNV.R
+```
+
+### Plot heatmap of inferCNV results (Supplementary Figure S5B).
+
+![](data/raw/02-scrnaseq/infercnv-simpleaf.pdf)
+
+### Plot inferCNV density plot of RB1 (Figure 4D).
+
+![](data/raw/02-scrnaseq/infercnv-simpleaf-RB1_simpleaf-quant-dds-allsamples_filterqc.pdf)
+
+## Print session info.
+
+```{r}
+sessionInfo()
+```
