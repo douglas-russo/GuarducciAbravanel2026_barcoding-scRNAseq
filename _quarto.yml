@@ -1,0 +1,26 @@
+project:
+  type: book
+  output-dir: docs
+
+book:
+  title: "Guarducci and Abravanel et al. (2026): Barcoding and scRNAseq Analyses"
+  author: "Douglas Russo"
+  date: "5/27/2026"
+  chapters:
+    - index.qmd
+    - cell-line-barcoding.qmd
+    - scrnaseq.qmd
+    - in-vivo-barcode-analyses.qmd
+
+bibliography: references.bib
+
+format:
+  html:
+    theme:
+      - cosmo
+      - brand
+  pdf:
+    documentclass: scrreprt
+
+execute: 
+  warning: false

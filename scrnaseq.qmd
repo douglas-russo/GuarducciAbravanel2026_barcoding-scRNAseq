@@ -1494,6 +1494,7 @@ get_genewise_rates_and_dispersions_per_sample <- function(
 ```
 
 ```{r}
+#| output: false
 get_genewise_rates_and_dispersions_per_sample()
 ```
 
@@ -1569,6 +1570,7 @@ get_genewise_rates_per_phase_within_sample <- function(
 ```
 
 ```{r}
+#| output: false
 get_genewise_rates_per_phase_within_sample()
 ```
 
